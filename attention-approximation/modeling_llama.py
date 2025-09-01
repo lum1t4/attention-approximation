@@ -18,29 +18,7 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
-    logging,
-    replace_return_docstrings,
-)
 from transformers.models.llama.configuration_llama import LlamaConfig
-
-logger = logging.get_logger(__name__)
-
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
 
 
 class LlamaRMSNorm(nn.Module):
@@ -58,9 +36,6 @@ class LlamaRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-
-
-ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -201,7 +176,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class LlamaAttention(nn.Module):
+class LlamaAttention(nn.Module): #you have to fix the logger
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
@@ -315,7 +290,7 @@ class LlamaAttention(nn.Module):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attention_mask is not None:  # no matter the length, we just slice it
+        if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
