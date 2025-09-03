@@ -1,24 +1,19 @@
+from einops import rearrange
 from .modeling_llama import LlamaMLP, LlamaRMSNorm
 from torch import nn
 from cirkit.symbolic.initializers import ConstantTensorInitializer
 from cirkit.pipeline import PipelineContext
 from transformers.models.llama.configuration_llama import LlamaConfig
-from typing import Optional, Tuple, List, Union
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 # Llama utilities (import these from your codebase)
-from .modeling_llama import LlamaMLP, LlamaRMSNorm
-from transformers.models.llama.configuration_llama import LlamaConfig
 
 # cirkit imports
-from cirkit.symbolic.initializers import ConstantTensorInitializer
-from cirkit.pipeline import PipelineContext
 from cirkit.utils.scope import Scope
 from cirkit.symbolic.circuit import Circuit
 from cirkit.symbolic.layers import HadamardLayer, SumLayer
@@ -77,7 +72,7 @@ class LlamaMLP(nn.Module):
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
-    
+
 def _input_layer_factory_builder(input_layer: str, dim: int, param: Parameterization) -> InputLayerFactory:
     """Build an InputLayerFactory using a Parameterization object (wrapping a TensorParameter).
     The Parameterization should contain a TensorParameter that wraps a ConstantTensorInitializer.
@@ -89,7 +84,7 @@ def _input_layer_factory_builder(input_layer: str, dim: int, param: Parameteriza
 def _build_cp_circuit_from_weights(
     shape: tuple[int, ...],
     rank: int,
-    weights: List[torch.Tensor],
+    weights: list[torch.Tensor],
     input_layer: str = "embedding",
 ) -> Circuit:
     """
@@ -105,18 +100,15 @@ def _build_cp_circuit_from_weights(
     Returns:
         A cirkit Circuit object (not compiled).
     """
-    if len(shape) != len(weights):
-        raise ValueError(
-            f"Expected {len(shape)} factor matrices, but got {len(weights)}."
-        )
-
     embedding_layer_factories = []
-    for i, (dim, w) in enumerate(zip(shape, weights)):
+    bs, seq_len, hidden_size = shape
+    shape = (seq_len, hidden_size)
+    for i, (dim, w) in enumerate(zip(shape, weights, strict=False)):
+        print("dim, w shape", dim, w.shape)
         if w.shape != (dim, rank):
-            raise ValueError(
-                f"Factor {i} has shape {w.shape}, but expected {(dim, rank)}."
-            )
+            raise ValueError(f"Factor {i} has shape {w.shape}, but expected {(dim, rank)}.")
         tensor_param = TensorParameter(
+            bs,
             dim,
             rank,
             initializer=ConstantTensorInitializer(w.detach().cpu().numpy()),
@@ -148,7 +140,7 @@ def _build_cp_circuit_from_weights(
     return circuit
 
 class LlamaApproximatedAttention(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -156,26 +148,23 @@ class LlamaApproximatedAttention(nn.Module):
             print(f"Instantiating {self.__class__.__name__} without `layer_idx` is not recommended.")
 
         self.hidden_size = config.hidden_size
+        self.seq_length = config.seq_length
         self.factorization_rank = config.factorization_rank
 
-        self.seq_factor_linear = nn.Linear(self.hidden_size, self.factorization_rank, bias=config.attention_bias)
+        self.seq_factor_linear = nn.Linear(self.seq_length, self.factorization_rank, bias=config.attention_bias)
         self.hidden_factor_linear = nn.Linear(self.hidden_size, self.factorization_rank, bias=config.attention_bias)
 
         self.ctx = PipelineContext(backend="torch", semiring="sum-product", fold=True, optimize=True)
-        self.compiled_ciruit = None
+        self.compiled_circuit = None
 
-    def forward(self, hidden_states: torch.Tensor, 
-                grid_chw: torch.Tensor
-                ) -> torch.Tensor:
-        
+    def forward(self, hidden_states: torch.Tensor, grid_chw: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.size()
-
-        seq_factors = self.seq_factor_linear(hidden_states)
-        hidden_factors = self.hidden_factor_(hidden_states)
-
-
-        shape = (seq_len, self.hidden_size)
-
+        print(hidden_states.shape, hidden_states.dtype)
+        x = rearrange(hidden_states, "b s h -> (b h) s")
+        seq_factors = self.seq_factor_linear(x)
+        y = rearrange(hidden_states, "b s h -> (b s) h")
+        hidden_factors = self.hidden_factor_linear(y)
+        shape = (batch_size, seq_len, self.hidden_size)
         if self.compiled_circuit is None:
             circuit = _build_cp_circuit_from_weights(
                 shape,
@@ -184,7 +173,7 @@ class LlamaApproximatedAttention(nn.Module):
                 input_layer="embedding"
             )
             self.compiled_circuit = self.ctx.compile(circuit)
-        
+
         attn_output = self.compiled_circuit(grid_chw).squeeze(dim=2).squeeze(dim=1).view(batch_size, seq_len, self.hidden_size)
 
         return  attn_output
@@ -210,8 +199,7 @@ class LlamaDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_out = self.attn_approx(hidden_states=hidden_states,
-                                    grid_chw=grid_chw)
+        attn_out = self.attn_approx(hidden_states=hidden_states,grid_chw=grid_chw)
 
         hidden_states = residual + attn_out
 
@@ -223,7 +211,7 @@ class LlamaDecoderLayer(nn.Module):
         outputs = (hidden_states,)
 
         return outputs
-    
+
 class LlamaPreTrainedModel(PreTrainedModel):
     config_class = LlamaConfig
     base_model_prefix = "model"
@@ -280,11 +268,11 @@ class LlamaModel(LlamaPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-        
+        inputs_embeds: torch.FloatTensor | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+    ) -> tuple | BaseModelOutputWithPast:
+
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -321,7 +309,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-            
+
             if self.layer_sharing:
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)

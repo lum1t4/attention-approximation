@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import os
 from attention_approximation.pytorch import WORLD_SIZE, LOCAL_RANK, RANK
-
+from attention_approximation.utils import LOGGER
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -23,11 +23,10 @@ class DataLoaderLite:
         # get the shard filenames
         shards = sorted((s for s in path.glob("*.npy") if split in s.name), key=lambda x: x.name)
         shards = [s.as_posix() for s in shards]
-        print(shards)
         self.shards = shards
         assert len(shards) > 0, f"no shards found for split {split}"
-        if LOCAL_RANK == 0:
-            print(f"found {len(shards)} shards for split {split}")
+        if LOCAL_RANK in {-1, 0}:
+            LOGGER.info(f"Found {len(shards)} shards for split {split}")
         self.reset()
 
     def reset(self):
@@ -52,7 +51,7 @@ class DataLoaderLite:
 
 
 if __name__ == "__main__":
-    print(LOCAL_RANK, WORLD_SIZE)
+    # Test run (CTRL + C to stop obviously)
     dataloader = DataLoaderLite(path=Path("data/edu_fineweb10B"), batch_size=8, seq_len=1024, process_rank=1, num_processes=WORLD_SIZE, split='train')
     x, y = dataloader.next_batch()
     while True:
