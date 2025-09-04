@@ -100,7 +100,7 @@ class CPCircuitLayer(nn.Module):
             chunk = all_indices[start:end]                   
             chunk = chunk.unsqueeze(0).expand(batch, -1, -1)     
             emb_list = []
-            for mode_idx in range(len(num_modes)):
+            for mode_idx in range(num_modes):
                 indices = chunk[:, :, mode_idx]              
                 w = embedding_weights[mode_idx]            
                 idx_expanded = indices.unsqueeze(-1).expand(-1, -1, self.rank)
