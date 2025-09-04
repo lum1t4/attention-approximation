@@ -11,18 +11,6 @@ from transformers.modeling_utils import PreTrainedModel
 import torch
 import torch.nn.functional as F
 
-# Llama utilities (import these from your codebase)
-
-# cirkit imports
-from cirkit.utils.scope import Scope
-from cirkit.symbolic.circuit import Circuit
-from cirkit.symbolic.layers import HadamardLayer, SumLayer
-from cirkit.symbolic.parameters import ConstantParameter, Parameter, TensorParameter
-from cirkit.templates.utils import (
-    InputLayerFactory,
-    Parameterization,
-    name_to_input_layer_factory,
-)
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -72,72 +60,63 @@ class LlamaMLP(nn.Module):
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
-
-def _input_layer_factory_builder(input_layer: str, dim: int, param: Parameterization) -> InputLayerFactory:
-    """Build an InputLayerFactory using a Parameterization object (wrapping a TensorParameter).
-    The Parameterization should contain a TensorParameter that wraps a ConstantTensorInitializer.
-    """
-    kwargs = {"num_states": dim, "weight": Parameter.from_input(param)}
-    return name_to_input_layer_factory(input_layer, **kwargs)
-
-
-def _build_cp_circuit_from_weights(
-    shape: tuple[int, ...],
-    rank: int,
-    weights: list[torch.Tensor],
-    input_layer: str = "embedding",
-) -> Circuit:
-    """
-    Build a CP circuit for an N-dimensional tensor decomposition.
     
-    Args:
-        shape: The full tensor shape (e.g. (num_heads, seq_len, head_dim)).
-        rank: CP decomposition rank.
-        weights: List of factor matrices, one per axis.
-                 Each must be shaped [axis_len, rank].
-        input_layer: Which input layer factory to use ("embedding" by default).
+
+
+class CPTorch(nn.Module):
+    def __init__(self, rank: int, out_units: int = 1):
+        super().__init__()
+        self.rank = int(rank)
+        self.out_units = int(out_units)
+        
+        self.weight = nn.Parameter(torch.ones(self.out_units, self.rank), requires_grad=False)
+
+    def forward(self, hadamard: torch.Tensor) -> torch.Tensor:
+        return hadamard @ self.weight.t()
+
+
+class CPCircuitModel(nn.Module):
+    def __init__(self, config: LlamaConfig, out_units: int = 1, chunk_size: int = 1000):
+        super().__init__()
+        self.out_units = out_units
+        self.chunk_size = chunk_size
+
+        self.seq_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias),
+        self.hidden_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias)
+
+        self.cp = CPTorch(rank=config.factorization_rank, out_units=self.out_units)
+
+    def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, hidden_size = hidden_states.size()
+        num_modes = hidden_states.dim() - 1
+        assert num_modes == 2, "This implementation only supports 2 modes (sequence and hidden)"
+
+        embedding_weights = [
+            self.seq_mode_factor(hidden_states),
+            self.hidden_mode_factor(hidden_states)
+        ]
     
-    Returns:
-        A cirkit Circuit object (not compiled).
-    """
-    embedding_layer_factories = []
-    bs, seq_len, hidden_size = shape
-    shape = (seq_len, hidden_size)
-    for i, (dim, w) in enumerate(zip(shape, weights, strict=False)):
-        print("dim, w shape", dim, w.shape)
-        if w.shape != (dim, rank):
-            raise ValueError(f"Factor {i} has shape {w.shape}, but expected {(dim, rank)}.")
-        tensor_param = TensorParameter(
-            bs,
-            dim,
-            rank,
-            initializer=ConstantTensorInitializer(w.detach().cpu().numpy()),
-            learnable=True,
-        )
-        embedding_layer_factories.append(
-            _input_layer_factory_builder(input_layer, dim, tensor_param)
-        )
-
-    embedding_layers = [f(Scope([i]), rank) for i, f in enumerate(embedding_layer_factories)]
-
-    hadamard_layer = HadamardLayer(rank, arity=len(shape))
-
-    sum_layer = SumLayer(
-        rank,
-        1,
-        arity=1,
-        weight=Parameter.from_input(ConstantParameter(1, rank, value=1.0)),
-    )
-
-    in_layers = {sum_layer: [hadamard_layer], hadamard_layer: embedding_layers}
-    outputs = [sum_layer]
-
-    circuit = Circuit(
-        layers=embedding_layers + [hadamard_layer, sum_layer],
-        in_layers=in_layers,
-        outputs=outputs,
-    )
-    return circuit
+        outputs = []
+        for start in range(0, all_indices.size(0), self.chunk_size):
+            end = start + self.chunk_size
+            chunk = all_indices[start:end]                   
+            chunk = chunk.unsqueeze(0).expand(B, -1, -1)     
+            emb_list = []
+            for mode_idx in range(len(num_modes)):
+                indices = chunk[:, :, mode_idx]              
+                w = embedding_weights[mode_idx]            
+                idx_expanded = indices.unsqueeze(-1).expand(-1, -1, self.rank)
+                emb = torch.gather(w, dim=1, index=idx_expanded)
+                emb_list.append(emb)
+    
+            stacked = torch.stack(emb_list, dim=0)
+            hadamard = torch.prod(stacked, dim=0)
+    
+            out_chunk = self.cp(hadamard)
+            outputs.append(out_chunk)
+    
+        out = torch.cat(outputs, dim=1)
+        return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
 
 class LlamaApproximatedAttention(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
@@ -148,34 +127,10 @@ class LlamaApproximatedAttention(nn.Module):
             print(f"Instantiating {self.__class__.__name__} without `layer_idx` is not recommended.")
 
         self.hidden_size = config.hidden_size
-        self.seq_length = config.seq_length
-        self.factorization_rank = config.factorization_rank
+        self.cp_circuit = CPCircuitModel(config=config, out_units=1, chunk_size=10_000)
 
-        self.seq_factor_linear = nn.Linear(self.seq_length, self.factorization_rank, bias=config.attention_bias)
-        self.hidden_factor_linear = nn.Linear(self.hidden_size, self.factorization_rank, bias=config.attention_bias)
-
-        self.ctx = PipelineContext(backend="torch", semiring="sum-product", fold=True, optimize=True)
-        self.compiled_circuit = None
-
-    def forward(self, hidden_states: torch.Tensor, grid_chw: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.size()
-        print(hidden_states.shape, hidden_states.dtype)
-        x = rearrange(hidden_states, "b s h -> (b h) s")
-        seq_factors = self.seq_factor_linear(x)
-        y = rearrange(hidden_states, "b s h -> (b s) h")
-        hidden_factors = self.hidden_factor_linear(y)
-        shape = (batch_size, seq_len, self.hidden_size)
-        if self.compiled_circuit is None:
-            circuit = _build_cp_circuit_from_weights(
-                shape,
-                self.factorization_rank,
-                [seq_factors, hidden_factors],
-                input_layer="embedding"
-            )
-            self.compiled_circuit = self.ctx.compile(circuit)
-
-        attn_output = self.compiled_circuit(grid_chw).squeeze(dim=2).squeeze(dim=1).view(batch_size, seq_len, self.hidden_size)
-
+    def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
+        attn_output = self.cp_circuit(hidden_states, all_indices)
         return  attn_output
 
 
@@ -193,13 +148,13 @@ class LlamaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        grid_chw: torch.Tensor
+        all_indices: torch.Tensor
     ):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_out = self.attn_approx(hidden_states=hidden_states,grid_chw=grid_chw)
+        attn_out = self.attn_approx(hidden_states=hidden_states, all_indices=all_indices)
 
         hidden_states = residual + attn_out
 
@@ -284,11 +239,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
         _, seq_len, hidden_size = hidden_states.size()
 
-        grid_chw = torch.stack(torch.meshgrid(
+        grid_y, grid_x = torch.meshgrid(
             torch.arange(seq_len, dtype=torch.long),
             torch.arange(hidden_size, dtype=torch.long),
             indexing="ij"
-        ), dim=-1).reshape(-1, 2)
+        )
+        all_indices = torch.stack([grid_y, grid_x], dim=-1).view(-1, 2)
 
         all_hidden_states = () if output_hidden_states else None
 
@@ -300,12 +256,12 @@ class LlamaModel(LlamaPreTrainedModel):
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
-                    grid_chw
+                    all_indices
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    grid_chw
+                    all_indices
                 )
 
             hidden_states = layer_outputs[0]
@@ -318,12 +274,12 @@ class LlamaModel(LlamaPreTrainedModel):
                     layer_outputs = self._gradient_checkpointing_func(
                         decoder_layer.__call__,
                         hidden_states,
-                        grid_chw
+                        all_indices
                     )
                 else:
                     layer_outputs = decoder_layer(
                         hidden_states,
-                        grid_chw
+                        all_indices
                     )
 
                 hidden_states = layer_outputs[0]
