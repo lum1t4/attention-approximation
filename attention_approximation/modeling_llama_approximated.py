@@ -74,9 +74,9 @@ class CP(nn.Module):
 
 
 class CPCircuitLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, out_units: int = 1, chunk_size: int = 1000):
+    def __init__(self, config: LlamaConfig, chunk_size: int = 1000):
         super().__init__()
-        self.out_units = out_units
+        self.out_units = 1
         self.chunk_size = chunk_size
 
         self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias),
@@ -124,8 +124,7 @@ class LlamaApproximatedAttention(nn.Module):
         if layer_idx is None:
             print(f"Instantiating {self.__class__.__name__} without `layer_idx` is not recommended.")
 
-        self.hidden_size = config.hidden_size
-        self.cp_circuit = CPCircuitLayer(config=config, out_units=1, chunk_size=10_000)
+        self.cp_circuit = CPCircuitLayer(config=config, chunk_size=10_000)
 
     def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
         attn_output = self.cp_circuit(hidden_states, all_indices)
@@ -136,7 +135,6 @@ class LlamaDecoderLayer(nn.Module):
 
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
         self.attn_approx = LlamaApproximatedAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
@@ -190,13 +188,6 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
 
 class LlamaModel(LlamaPreTrainedModel):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
-
-    Args:
-        config: LlamaConfig
-    """
-
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
