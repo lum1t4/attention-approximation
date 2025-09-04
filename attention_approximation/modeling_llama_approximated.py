@@ -67,7 +67,6 @@ class CP(nn.Module):
         super().__init__()
         self.rank = int(rank)
         self.out_units = int(out_units)
-        
         self.weight = nn.Parameter(torch.ones(self.out_units, self.rank), requires_grad=False)
 
     def forward(self, hadamard: torch.Tensor) -> torch.Tensor:
@@ -92,7 +91,7 @@ class CPCircuitLayer(nn.Module):
 
         embedding_weights = [
             self.seq_mode_factor(hidden_states),
-            self.hidden_mode_factor(hidden_states.transpose(1, 2))
+            self.hidden_mode_factor(hidden_states.transpose(1, 2).contiguous())
         ]
     
         outputs = []
