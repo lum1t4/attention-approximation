@@ -1,8 +1,5 @@
-from einops import rearrange
 from .modeling_llama import LlamaMLP, LlamaRMSNorm
 from torch import nn
-from cirkit.symbolic.initializers import ConstantTensorInitializer
-from cirkit.pipeline import PipelineContext
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.activations import ACT2FN
@@ -74,68 +71,82 @@ class CP(nn.Module):
 
 
 class CPCircuitLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, chunk_size: int = 1000):
+    def __init__(self, config: LlamaConfig, chunk_size: int = 1_000):
         super().__init__()
         self.out_units = 1
+        self.rank = config.factorization_rank
         self.chunk_size = chunk_size
 
-        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias),
+        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias)
         self.hidden_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias)
 
         self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
 
     def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_size = hidden_states.size()
-        num_modes = hidden_states.dim() - 1
-        assert num_modes == 2, "This implementation only supports 2 modes (sequence and hidden)"
+        device = hidden_states.device
 
-        embedding_weights = [
-            self.seq_mode_factor(hidden_states),
-            self.hidden_mode_factor(hidden_states.transpose(1, 2).contiguous())
-        ]
-    
+        # Convert indices to device if needed
+        all_indices = all_indices.to(device)
+
+        # Compute embeddings for each mode
+        # seq_mode: [batch, seq_len, rank]
+        seq_embeddings = self.seq_mode_factor(hidden_states)
+
+        # For hidden mode, we need to transpose and apply the linear layer
+        # hidden_states: [batch, seq_len, hidden_size] -> [batch, hidden_size, seq_len]
+        hidden_transposed = hidden_states.transpose(1, 2)
+        # hidden_mode: [batch, hidden_size, rank]
+        hidden_embeddings = self.hidden_mode_factor(hidden_transposed)
+
         outputs = []
         for start in range(0, all_indices.size(0), self.chunk_size):
-            end = start + self.chunk_size
-            chunk = all_indices[start:end]                   
-            chunk = chunk.unsqueeze(0).expand(batch, -1, -1)     
-            emb_list = []
-            for mode_idx in range(num_modes):
-                indices = chunk[:, :, mode_idx]              
-                w = embedding_weights[mode_idx]            
-                idx_expanded = indices.unsqueeze(-1).expand(-1, -1, self.rank)
-                emb = torch.gather(w, dim=1, index=idx_expanded)
-                emb_list.append(emb)
-    
-            stacked = torch.stack(emb_list, dim=0)
-            hadamard = torch.prod(stacked, dim=0)
-    
-            out_chunk = self.cp(hadamard)
+            end = min(start + self.chunk_size, all_indices.size(0))
+            chunk = all_indices[start:end]  # [chunk_size, 2]
+
+            # Get indices for each mode
+            seq_indices = chunk[:, 0].long()  # [chunk_size]
+            hidden_indices = chunk[:, 1].long()  # [chunk_size]
+
+            # Expand for batch dimension
+            seq_indices = seq_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
+            hidden_indices = hidden_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
+
+            # Index into embeddings
+            # seq_embeddings: [batch, seq_len, rank]
+            seq_indices_expanded = seq_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
+            seq_emb = torch.gather(seq_embeddings, dim=1, index=seq_indices_expanded)  # [batch, chunk_size, rank]
+
+            # hidden_embeddings: [batch, hidden_size, rank]
+            hidden_indices_expanded = hidden_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
+            hidden_emb = torch.gather(hidden_embeddings, dim=1, index=hidden_indices_expanded)  # [batch, chunk_size, rank]
+
+            # Compute hadamard product
+            hadamard = seq_emb * hidden_emb  # [batch, chunk_size, rank]
+
+            # Apply CP decomposition
+            out_chunk = self.cp(hadamard)  # [batch, chunk_size, out_units]
             outputs.append(out_chunk)
-    
-        out = torch.cat(outputs, dim=1)
+
+        out = torch.cat(outputs, dim=1)  # [batch, total_size, out_units]
         return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
 
 class LlamaApproximatedAttention(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
+    def __init__(self, config: LlamaConfig, all_indices: torch.Tensor):
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            print(f"Instantiating {self.__class__.__name__} without `layer_idx` is not recommended.")
-
+        self.all_indices = all_indices
         self.cp_circuit = CPCircuitLayer(config=config, chunk_size=10_000)
 
-    def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
-        attn_output = self.cp_circuit(hidden_states, all_indices)
+    def forward(self, hidden_states: torch.Tensor, **kargs) -> torch.Tensor:
+        attn_output = self.cp_circuit(hidden_states, self.all_indices)
         return  attn_output
 
 
 class LlamaDecoderLayer(nn.Module):
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.attn_approx = LlamaApproximatedAttention(config=config, layer_idx=layer_idx)
+        self.attn_approx = LlamaApproximatedAttention(config=config)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -144,16 +155,14 @@ class LlamaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        all_indices: torch.Tensor
+        all_indices: torch.Tensor,
     ):
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
 
         attn_out = self.attn_approx(hidden_states=hidden_states, all_indices=all_indices)
 
         hidden_states = residual + attn_out
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
