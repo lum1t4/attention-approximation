@@ -60,10 +60,9 @@ class LlamaMLP(nn.Module):
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
-    
 
 
-class CPTorch(nn.Module):
+class CP(nn.Module):
     def __init__(self, rank: int, out_units: int = 1):
         super().__init__()
         self.rank = int(rank)
@@ -75,16 +74,16 @@ class CPTorch(nn.Module):
         return hadamard @ self.weight.t()
 
 
-class CPCircuitModel(nn.Module):
+class CPCircuitLayer(nn.Module):
     def __init__(self, config: LlamaConfig, out_units: int = 1, chunk_size: int = 1000):
         super().__init__()
         self.out_units = out_units
         self.chunk_size = chunk_size
 
-        self.seq_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias),
-        self.hidden_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias)
+        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias),
+        self.hidden_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias)
 
-        self.cp = CPTorch(rank=config.factorization_rank, out_units=self.out_units)
+        self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
 
     def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_size = hidden_states.size()
@@ -93,14 +92,14 @@ class CPCircuitModel(nn.Module):
 
         embedding_weights = [
             self.seq_mode_factor(hidden_states),
-            self.hidden_mode_factor(hidden_states)
+            self.hidden_mode_factor(hidden_states.transpose(1, 2))
         ]
     
         outputs = []
         for start in range(0, all_indices.size(0), self.chunk_size):
             end = start + self.chunk_size
             chunk = all_indices[start:end]                   
-            chunk = chunk.unsqueeze(0).expand(B, -1, -1)     
+            chunk = chunk.unsqueeze(0).expand(batch, -1, -1)     
             emb_list = []
             for mode_idx in range(len(num_modes)):
                 indices = chunk[:, :, mode_idx]              
@@ -127,7 +126,7 @@ class LlamaApproximatedAttention(nn.Module):
             print(f"Instantiating {self.__class__.__name__} without `layer_idx` is not recommended.")
 
         self.hidden_size = config.hidden_size
-        self.cp_circuit = CPCircuitModel(config=config, out_units=1, chunk_size=10_000)
+        self.cp_circuit = CPCircuitLayer(config=config, out_units=1, chunk_size=10_000)
 
     def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
         attn_output = self.cp_circuit(hidden_states, all_indices)
