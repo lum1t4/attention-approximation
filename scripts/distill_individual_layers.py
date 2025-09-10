@@ -23,6 +23,7 @@ from attention_approximation.modeling_llama_approximated import LlamaApproximate
 from attention_approximation.pytorch import device_parse, intersect_dicts, WORLD_SIZE, LOCAL_RANK, RANK, rank_zero_only, de_parallel
 from attention_approximation.utils import LOGGER
 from attention_approximation.data import DistributedDataLoader
+
 DDP_ENABLED = WORLD_SIZE > 1
 
 @dataclass
@@ -131,10 +132,7 @@ def patch_model(state, model: nn.Module) -> tuple[nn.Module, list[nn.Parameter]]
     student_params = []
     for layer in model.model.layers:
         student_params.extend(layer.self_attn.student_att.parameters())
-
-    if LOCAL_RANK in {-1, 0}:
-        LOGGER.info(f"Total student parameters to train: {sum(p.numel() for p in student_params):,}")
-
+    print0(f"Total student parameters to train: {sum(p.numel() for p in student_params):,}")
     return model, student_params
 
 
@@ -167,12 +165,9 @@ def setup_optimizer(state):
 
 def setup_scheduler(state):
     """Initializes the cosine annealing learning rate scheduler."""
-    return CosineAnnealingLR(
-        state.optimizer,
-        T_max=state.config.max_steps,
-        eta_min=state.config.min_learning_rate
-    )
-
+    max_steps = state.config.max_steps
+    mlr = state.config.min_learning_rate
+    return CosineAnnealingLR(state.optimizer, T_max=max_steps, eta_min=mlr)
 
 def setup_dataloaders(state):
     """Initializes the data loaders for training and validation."""
@@ -226,7 +221,7 @@ def training_step(state: TrainContext, batch, step: int):
 
 
 @torch.inference_mode()
-def validate(state):
+def validate(state: TrainContext) -> float:
     """Runs the validation loop and returns the average loss."""
     # Ensure model is in a consistent state for validation
     state.model.eval()
@@ -248,9 +243,6 @@ def validate(state):
 
         if num_att_layers > 0:
             total_loss += (batch_att_loss / num_att_layers)
-
-    # Switch back to training mode for student params
-    state.model.train()
 
     # Aggregate losses across all DDP processes
     if DDP_ENABLED:
@@ -297,7 +289,6 @@ def train(state):
     if LOCAL_RANK in {-1, 0}:
         LOGGER.info("Starting training...")
 
-    state.model.train() # Set student params to training mode
     state.optimizer.zero_grad()
 
     running_loss = 0
@@ -324,14 +315,14 @@ def train(state):
             start_time = time.time()
 
         if (step + 1) % state.config.val_interval == 0:
-            val_loss = state.validate()
+            val_loss = validate(state)
             if LOCAL_RANK in {-1, 0}:
                 LOGGER.info(f"Validation Distill Loss: {val_loss:.4f}")
 
         if (step + 1) % state.config.save_interval == 0:
-            state.save_checkpoint(step + 1)
+            save_checkpoint(state, step + 1)
 
-    state.save_checkpoint(state.config.max_steps)
+    save_checkpoint(state, state.config.max_steps)
     if LOCAL_RANK in {-1, 0}:
         LOGGER.info("Training completed!")
 
@@ -339,7 +330,8 @@ def train(state):
         dist.destroy_process_group()
 
 
-def main():
+
+if __name__ == "__main__":
     """Parses command-line arguments, creates config and context, then starts training."""
     parser = argparse.ArgumentParser(description="Train replaced attention layers in a LLaMA model via distillation.")
 
@@ -358,7 +350,3 @@ def main():
     train_config = TrainingConfig(**vars(args))
     state = TrainContext(train_config)
     train(state)
-
-
-if __name__ == "__main__":
-    main()
