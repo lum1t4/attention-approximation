@@ -3,12 +3,11 @@ This script is used to train replaced attention layers in a LLaMA model
 using L2 loss to distill the attention outputs from the original attention layers.
 """
 
-import os
 import time
 import argparse
 from copy import copy
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections.abc import Callable
 
 import torch
@@ -19,14 +18,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
 from transformers import LlamaConfig
 import safetensors
-
 from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherModel
 from attention_approximation.modeling_llama_approximated import LlamaApproximatedAttention
 from attention_approximation.pytorch import device_parse, intersect_dicts, WORLD_SIZE, LOCAL_RANK, RANK, rank_zero_only, de_parallel
 from attention_approximation.utils import LOGGER
-from attention_approximation.data import DataLoaderLite
-
-
+from attention_approximation.data import DistributedDataLoader
 DDP_ENABLED = WORLD_SIZE > 1
 
 @dataclass
@@ -37,7 +33,7 @@ class TrainingConfig:
     model_weights_path: str = "data/MobileLLM/model.safetensors"
     data_path: str = "data/edu_fineweb10B"
     checkpoint_dir: str = "checkpoints"
-
+    device: str = "mps"
     # Training Hyperparameters
     max_steps: int = 10000
     batch_size: int = 2
@@ -59,6 +55,10 @@ class TrainingConfig:
     factorization_rank: int = 16
     layer_sharing: bool = False
 
+
+@rank_zero_only
+def print0(s:str):
+    LOGGER.info(s)
 
 class AttentionDistillationWrapper(nn.Module):
     """
@@ -92,7 +92,7 @@ class AttentionDistillationWrapper(nn.Module):
 
 class TrainContext:
     config: TrainingConfig
-    model: nn.Module | nn.DistributedDataParallel
+    model: nn.Module | nn.parallel.DistributedDataParallel
     device: torch.device
 
     def __init__(self, config: TrainingConfig):
@@ -117,8 +117,8 @@ def patch_model(state, model: nn.Module) -> tuple[nn.Module, list[nn.Parameter]]
 
     model.requires_grad_(False)  # Freeze the entire model initially
     for i, layer in enumerate(model.model.layers):
-        original_attn = layer.state_attn
-        layer.state_attn = AttentionDistillationWrapper(
+        original_attn = layer.self_attn
+        layer.self_attn = AttentionDistillationWrapper(
             student_att=LlamaApproximatedAttention,
             teacher_att=original_attn,
             config=student_config
@@ -130,7 +130,7 @@ def patch_model(state, model: nn.Module) -> tuple[nn.Module, list[nn.Parameter]]
 
     student_params = []
     for layer in model.model.layers:
-        student_params.extend(layer.state_attn.student_att.parameters())
+        student_params.extend(layer.self_attn.student_att.parameters())
 
     if LOCAL_RANK in {-1, 0}:
         LOGGER.info(f"Total student parameters to train: {sum(p.numel() for p in student_params):,}")
@@ -144,24 +144,19 @@ def setup_model(state):
     config = LlamaConfig().from_json_file(state.config.model_config_path)
     model = TeacherModel(config)
 
-    if LOCAL_RANK in {-1, 0}:
-        checkpoint = safetensors.torch.load_file(state.config.model_weights_path)
-        csd = intersect_dicts(checkpoint, model.state_dict())
-        model.load_state_dict(csd, strict=False)
-        LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
-
+    checkpoint = safetensors.torch.load_file(state.config.model_weights_path)
+    csd = intersect_dicts(checkpoint, model.state_dict())
+    model.load_state_dict(csd, strict=False)
+    print0(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
     # Ensure all processes have the same initial weights if in DDP mode
     if DDP_ENABLED:
         dist.barrier()
-
     model.eval() # Teacher parts of the model should be in eval mode
     model, student_params = patch_model(state, model)
-
     if DDP_ENABLED:
         # DDP requires find_unused_parameters=True because the final model output
         # does not depend on the student parameters, only the distillation loss does.
         model = DDP(model, device_ids=[LOCAL_RANK], find_unused_parameters=True)
-
     return model, student_params
 
 
@@ -181,20 +176,16 @@ def setup_scheduler(state):
 
 def setup_dataloaders(state):
     """Initializes the data loaders for training and validation."""
-    train_loader = DataLoaderLite(
+    train_loader = DistributedDataLoader(
         path=Path(state.config.data_path),
         batch_size=state.config.batch_size,
         seq_len=state.config.seq_length,
-        process_rank=RANK,
-        num_processes=WORLD_SIZE,
         split='train'
     )
-    val_loader = DataLoaderLite(
+    val_loader = DistributedDataLoader(
         path=Path(state.config.data_path),
         batch_size=state.config.batch_size,
         seq_len=state.config.seq_length,
-        process_rank=RANK,
-        num_processes=WORLD_SIZE,
         split='val'
     )
     return train_loader, val_loader
@@ -215,8 +206,8 @@ def training_step(state: TrainContext, batch, step: int):
     num_att_layers = 0
 
     for layer in model.model.layers:
-        if hasattr(layer.state_attn, 'last_distillation_loss'):
-            total_att_loss += layer.state_attn.last_distillation_loss
+        if hasattr(layer.self_attn, 'last_distillation_loss'):
+            total_att_loss += layer.self_attn.last_distillation_loss
             num_att_layers += 1
 
     assert num_att_layers > 0, "No attention layers found for distillation."
@@ -251,8 +242,8 @@ def validate(state):
         batch_att_loss = 0
         num_att_layers = 0
         for layer in model.model.layers:
-            if hasattr(layer.state_attn, 'last_distillation_loss'):
-                batch_att_loss += layer.state_attn.last_distillation_loss.item()
+            if hasattr(layer.self_attn, 'last_distillation_loss'):
+                batch_att_loss += layer.self_attn.last_distillation_loss.item()
                 num_att_layers += 1
 
         if num_att_layers > 0:
@@ -273,26 +264,17 @@ def validate(state):
 @rank_zero_only
 def save_checkpoint(state, step):
     """Saves a training checkpoint, only on the master process."""
-    model_to_save = state.model.module if DDP_ENABLED else state.model
-
-    student_state = {}
-    for i, layer in enumerate(model_to_save.model.layers):
-        layer_state = layer.state_attn.student_att.state_dict()
-        for k, v in layer_state.items():
-            student_state[f"layer_{i}.state_attn.{k}"] = v
-
-    checkpoint = {
+    model = de_parallel(state.model) if DDP_ENABLED else state.model
+    ckpt = Path(state.config.checkpoint_dir)
+    ckpt.mkdir(exist_ok=True)
+    ckpt = ckpt / f"checkpoint_step_{step}.pt"
+    torch.save({
         'step': step,
-        'model_state_dict': student_state,
+        'model_state_dict': model.state_dict(),
         'optimizer_state_dict': state.optimizer.state_dict(),
         'scheduler_state_dict': state.scheduler.state_dict(),
-    }
-
-    checkpoint_dir = Path(state.config.checkpoint_dir)
-    checkpoint_dir.mkdir(exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"checkpoint_step_{step}.pt"
-    torch.save(checkpoint, checkpoint_path)
-    LOGGER.info(f"Saved checkpoint to {checkpoint_path}")
+    }, ckpt)
+    LOGGER.info(f"Saved checkpoint to {ckpt}")
 
 
 def train(state):
