@@ -22,7 +22,53 @@ from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherMo
 from attention_approximation.modeling_llama_approximated import LlamaApproximatedAttention
 from attention_approximation.pytorch import device_parse, intersect_dicts, WORLD_SIZE, LOCAL_RANK, RANK, rank_zero_only, de_parallel
 from attention_approximation.utils import LOGGER
-from attention_approximation.data import DistributedDataLoader
+import numpy as np
+
+
+def load_tokens(filename):
+    npt = np.load(filename).astype(np.int32)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+
+class DistributedDataLoader:
+    def __init__(self, path: Path, batch_size: int, seq_len: int, split: str):
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.rank = max(RANK, 0)
+        self.num_processes = WORLD_SIZE
+        self.current_shard = None
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        shards = sorted((s for s in path.glob("*.npy") if split in s.name), key=lambda x: x.name)
+        shards = [s.as_posix() for s in shards]
+        assert len(shards) > 0, f"no shards found for split {split}"
+        self.shards = shards
+        if LOCAL_RANK in {-1, 0}:
+            LOGGER.info(f"Found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        if self.current_shard != 0:
+            self.current_shard = 0
+            self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.batch_size * self.seq_len * self.rank
+
+    def next_batch(self):
+        B, T = self.batch_size, self.seq_len
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.rank
+        return x, y
+
 
 DDP_ENABLED = WORLD_SIZE > 1
 
@@ -118,10 +164,9 @@ def patch_model(state, model: nn.Module) -> tuple[nn.Module, list[nn.Parameter]]
 
     model.requires_grad_(False)  # Freeze the entire model initially
     for i, layer in enumerate(model.model.layers):
-        original_attn = layer.self_attn
         layer.self_attn = AttentionDistillationWrapper(
             student_att=LlamaApproximatedAttention,
-            teacher_att=original_attn,
+            teacher_att=layer.self_attn,
             config=student_config
         )
         if LOCAL_RANK in {-1, 0}:
@@ -225,24 +270,22 @@ def validate(state: TrainContext) -> float:
     """Runs the validation loop and returns the average loss."""
     # Ensure model is in a consistent state for validation
     state.model.eval()
-    total_loss = 0
+    total_loss = torch.tensor(0.0, device=state.device, requires_grad=False)
     for _ in range(state.config.val_batches):
         x, y = state.val_loader.next_batch()
         x, y = x.to(state.device), y.to(state.device)
         _ = state.model(x, labels=y)
-
         model = de_parallel(state.model)
-
         # Collect distillation losses for validation
-        batch_att_loss = 0
+        step_loss = torch.tensor(0.0, device=state.device, requires_grad=False)
         num_att_layers = 0
         for layer in model.model.layers:
             if hasattr(layer.self_attn, 'last_distillation_loss'):
-                batch_att_loss += layer.self_attn.last_distillation_loss.item()
+                step_loss += layer.self_attn.last_distillation_loss
                 num_att_layers += 1
 
         if num_att_layers > 0:
-            total_loss += (batch_att_loss / num_att_layers)
+            total_loss += (step_loss / num_att_layers)
 
     # Aggregate losses across all DDP processes
     if DDP_ENABLED:
@@ -296,16 +339,13 @@ def train(state):
 
     for step in range(state.config.max_steps):
         batch = state.train_loader.next_batch()
-
         distillation_loss = training_step(state, batch, step)
         running_loss += distillation_loss
-
         if LOCAL_RANK in {-1, 0} and (step + 1) % state.config.log_interval == 0:
             avg_loss = running_loss / state.config.log_interval
             elapsed = time.time() - start_time
             tokens_per_sec = (state.config.batch_size * state.config.seq_length * state.config.log_interval * WORLD_SIZE) / elapsed
-
-            LOGGER.info(
+            print0(
                 f"Step {step+1}/{state.config.max_steps} | "
                 f"Distill Loss: {avg_loss:.4f} | "
                 f"LR: {state.scheduler.get_last_lr()[0]:.2e} | "
@@ -316,16 +356,12 @@ def train(state):
 
         if (step + 1) % state.config.val_interval == 0:
             val_loss = validate(state)
-            if LOCAL_RANK in {-1, 0}:
-                LOGGER.info(f"Validation Distill Loss: {val_loss:.4f}")
+            print0(f"Validation Distill Loss: {val_loss:.4f}")
 
         if (step + 1) % state.config.save_interval == 0:
             save_checkpoint(state, step + 1)
 
-    save_checkpoint(state, state.config.max_steps)
-    if LOCAL_RANK in {-1, 0}:
-        LOGGER.info("Training completed!")
-
+    print0("Training completed!")
     if DDP_ENABLED:
         dist.destroy_process_group()
 
@@ -335,16 +371,53 @@ if __name__ == "__main__":
     """Parses command-line arguments, creates config and context, then starts training."""
     parser = argparse.ArgumentParser(description="Train replaced attention layers in a LLaMA model via distillation.")
 
-    # Dynamically add arguments from the TrainingConfig dataclass
-    config = TrainingConfig()
-    for field_name, field_type in config.__annotations__.items():
-        if field_name not in ['ddp', 'ddp_world_size', 'ddp_rank', 'ddp_local_rank', 'master_process']:
-            default_val = getattr(config, field_name)
-            arg_type = field_type
-            if isinstance(default_val, bool):
-                parser.add_argument(f"--{field_name}", action='store_true', default=default_val)
-            else:
-                parser.add_argument(f"--{field_name}", type=arg_type, default=default_val)
+    # Model and Data Paths
+    parser.add_argument("--model_config_path", type=str, default="data/MobileLLM/config.json",
+                        help="Path to the LLaMA model config JSON file.")
+    parser.add_argument("--model_weights_path", type=str, default="data/MobileLLM/model.safetensors",
+                        help="Path to the pretrained model weights (safetensors).")
+    parser.add_argument("--data_path", type=str, default="data/edu_fineweb10B",
+                        help="Path to the training/validation dataset shards.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
+                        help="Directory to save checkpoints.")
+    parser.add_argument("--device", type=str, default="mps",
+                        help="Device to train on (cuda, cpu, mps).")
+
+    # Training Hyperparameters
+    parser.add_argument("--max_steps", type=int, default=10000,
+                        help="Total number of training steps.")
+    parser.add_argument("--batch_size", type=int, default=2,
+                        help="Batch size per process.")
+    parser.add_argument("--seq_length", type=int, default=128,
+                        help="Sequence length for training.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
+                        help="Steps to accumulate gradients before optimizer step.")
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
+                        help="Initial learning rate.")
+    parser.add_argument("--min_learning_rate", type=float, default=1e-5,
+                        help="Minimum learning rate for cosine annealing scheduler.")
+    parser.add_argument("--weight_decay", type=float, default=1e-5,
+                        help="Weight decay for optimizer.")
+    parser.add_argument("--warmup_steps", type=int, default=100,
+                        help="Number of warmup steps for scheduler.")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Maximum gradient norm for clipping.")
+
+    # Logging and Saving
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="How often to log training metrics (in steps).")
+    parser.add_argument("--save_interval", type=int, default=1000,
+                        help="How often to save checkpoints (in steps).")
+    parser.add_argument("--val_interval", type=int, default=250,
+                        help="How often to run validation (in steps).")
+    parser.add_argument("--val_batches", type=int, default=10,
+                        help="Number of validation batches to average over.")
+
+    # Student Model Configuration
+    parser.add_argument("--factorization_rank", type=int, default=16,
+                        help="Factorization rank for approximated attention.")
+    parser.add_argument("--layer_sharing", action="store_true",
+                        help="Enable layer sharing in student attention.")
 
     args = parser.parse_args()
     train_config = TrainingConfig(**vars(args))

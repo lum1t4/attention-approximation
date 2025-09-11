@@ -40,7 +40,7 @@ def main(
     # Create output directory if it doesn't exist
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     dataset = load_dataset(dataset, name=remote_name, split='train', streaming=True)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer, use_fast=False, legacy=False, token=hf_token)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer, use_fast=False, legacy=False)
     token_dtype = np.int32 if tokenizer.vocab_size > 2**16 else np.uint16
     nprocs = max(1, os.cpu_count() // 2)
     tokenize_fn = partial(tokenize_document, tokenizer=tokenizer, token_dtype=token_dtype)
@@ -81,7 +81,6 @@ if __name__ == "__main__":
     parser.add_argument('--remote_name', type=str, required=False, help='The name of the remote dataset to use.') # default="sample-10BT"
     parser.add_argument('--shard_size', type=int, default=10**8, help='The number of tokens per shard.')
     parser.add_argument('--tokenizer', type=str, default="facebook/MobileLLM-350M-layer-share", help='The name of the Hugging Face tokenizer to use.')
-    parser.add_argument('--hf-token', type=str, required=False, help='The Hugging Face token for authentication.')
     parser.add_argument('--output-dir', type=str, default="data/edu_fineweb10B", help='The directory to save the output shards.')
     args = parser.parse_args()
     main(**vars(args))

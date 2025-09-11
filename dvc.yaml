@@ -1,0 +1,7 @@
+stages:
+  download_data:
+    cmd: uv run scripts/dataset_hf_to_bin.py --dataset "JeanKaddour/minipile" --output-dir "data/minipile" --hf-token $HF_TOKEN
+    deps:
+      - scripts/dataset_hf_to_bin.py
+    outs:
+      - data/minipile
