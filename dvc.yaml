@@ -5,3 +5,14 @@ stages:
       - scripts/dataset_hf_to_bin.py
     outs:
       - data/minipile
+  distill_first_phase:
+    cmd: torchrun --nproc_per_node=2 scripts/distill_full_model.py \
+          --model_config_path "data/MobileLLM/config.json" \
+          --model_weights_path "data/MobileLLM/model.safetensors" \
+          --data_path "data/edu_fineweb10B" \
+          --checkpoint_dir "checkpoints/full_model_distill_ddp" \
+          --batch_size 4 \
+          --learning_rate 1e-4 \
+          --alpha 0.5 \
+          --temperature 2.0 \
+          --device "cuda" # Device is handled by DDP, just specify the backend

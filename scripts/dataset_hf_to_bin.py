@@ -14,33 +14,6 @@ def tokenize_document(doc, tokenizer, token_dtype):
     return np.array(tokens, dtype=token_dtype)
 
 
-def worker_write(doc, tokenizer, token_dtype, shard_size, output_dir, state):
-    """Tokenize and write tokens directly into shard files."""
-    tokens = tokenize_document(doc, tokenizer, token_dtype)
-
-    # Keep track of where we are in the current shard
-    shard_index, token_count, all_tokens_np = state
-
-    if token_count + len(tokens) < shard_size:
-        all_tokens_np[token_count:token_count+len(tokens)] = tokens
-        token_count += len(tokens)
-    else:
-        # finalize current shard
-        split = "val" if shard_index == 0 else "train"
-        filename = os.path.join(output_dir, f"edufineweb_{split}_{shard_index:06d}")
-        remainder = shard_size - token_count
-        all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-        np.save(filename, all_tokens_np)
-
-        # start new shard
-        shard_index += 1
-        leftover = tokens[remainder:]
-        all_tokens_np[0:len(leftover)] = leftover
-        token_count = len(leftover)
-
-    return shard_index, token_count, all_tokens_np
-
-
 def main(
         dataset: str,
         tokenizer: str,
@@ -57,31 +30,42 @@ def main(
     token_dtype = np.int32 if tokenizer.vocab_size > 2**16 else np.uint16
     nprocs = max(1, os.cpu_count() // 2)
 
-    manager = mp.Manager()
-    state = manager.list([0, 0, np.empty((shard_size,), dtype=token_dtype)])  
-    # [shard_index, token_count, current buffer]
+    tokenize_fn = partial(tokenize_document, tokenizer=tokenizer, token_dtype=token_dtype)
 
-    worker_fn = partial(
-        worker_write,
-        tokenizer=tokenizer,
-        token_dtype=token_dtype,
-        shard_size=shard_size,
-        output_dir=output_dir,
-        state=state,
-    )
+    shard_index = 0
+    all_tokens_np = np.empty((shard_size,), dtype=token_dtype)
+    token_count = 0
+    progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
 
     with mp.Pool(nprocs) as pool:
-        progress_bar = tqdm(unit="docs", desc="Processing")
-        for _ in pool.imap_unordered(worker_fn, dataset, chunksize=16):
-            progress_bar.update(1)
-        progress_bar.close()
+        for tokens in pool.imap(tokenize_fn, dataset, chunksize=16):
+            if token_count + len(tokens) < shard_size:
+                all_tokens_np[token_count:token_count+len(tokens)] = tokens
+                token_count += len(tokens)
+                progress_bar.update(len(tokens))
+            else:
+                # finish current shard
+                split = "val" if shard_index == 0 else "train"
+                filename = os.path.join(output_dir, f"edufineweb_{split}_{shard_index:06d}")
+                remainder = shard_size - token_count
+                all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
+                np.save(filename, all_tokens_np)
 
-    # write the last unfinished shard
-    shard_index, token_count, all_tokens_np = state
+                shard_index += 1
+                progress_bar.close()
+                progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
+
+                leftover = tokens[remainder:]
+                all_tokens_np[0:len(leftover)] = leftover
+                token_count = len(leftover)
+                progress_bar.update(len(leftover))
+
+    # write last incomplete shard
     if token_count > 0:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(output_dir, f"edufineweb_{split}_{shard_index:06d}")
         np.save(filename, all_tokens_np[:token_count])
+    progress_bar.close()
 
 
 if __name__ == "__main__":

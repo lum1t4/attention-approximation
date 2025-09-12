@@ -1,24 +1,33 @@
+# scripts/distill_full_model.py
 """
-This script implements knowledge distillation using final model logits
-following the RADLADS Step 1 approach with KL divergence loss.
+This script trains a student LLaMA model with approximated attention layers
+by distilling knowledge from a larger, frozen teacher model.
+
+It incorporates several advanced features:
+1.  Automatic Mixed Precision (AMP) for faster training and reduced memory usage.
+2.  Memory-efficient loss chunking to handle long sequences.
+3.  Robust checkpointing and resuming for long training runs.
+
+The distillation is performed using a combination of KL Divergence and Cross-Entropy loss.
 """
 
 import time
 import argparse
+from copy import copy
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, fields
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import LlamaConfig
-import safetensors.torch
-from attention_approximation.modeling_llama import LlamaForCausalLM
+
+import safetensors
+from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherModel
+from attention_approximation.modeling_llama_approximated import LlamaForCausalLM as StudentModel
 from attention_approximation.pytorch import (
     device_parse,
     intersect_dicts,
@@ -29,41 +38,41 @@ from attention_approximation.pytorch import (
     de_parallel,
 )
 from attention_approximation.utils import LOGGER
-from attention_approximation.data import DistributedDataLoader
+from distill_individual_layers import DistributedDataLoader
 
 
 DDP_ENABLED = WORLD_SIZE > 1
 
 
 @dataclass
-class LogitsDistillationConfig:
-    """Configuration for logits-based knowledge distillation."""
+class TrainingConfig:
+    """Stores all hyperparameters and configuration settings."""
 
     # Model and Data Paths
-    teacher_config_path: str = "data/MobileLLM/config.json"
-    teacher_weights_path: str = "data/MobileLLM/model.safetensors"
-    student_config_path: str = "data/MobileLLM/config.json"  # Can be different
-    student_weights_path: Optional[str] = None  # None for random init
+    model_config_path: str = "data/MobileLLM/config.json"
+    model_weights_path: str = "data/MobileLLM/model.safetensors"
     data_path: str = "data/edu_fineweb10B"
-    checkpoint_dir: str = "checkpoints/logits_distillation"
-    device: str = "mps"
+    checkpoint_dir: str = "checkpoints_full_model"
+    resume_from_checkpoint: str | None = None  # Path to a checkpoint to resume from
 
     # Training Hyperparameters
-    max_steps: int = 50000
+    max_steps: int = 20000
     batch_size: int = 2
-    seq_length: int = 512
+    seq_length: int = 512  # Increased default to show value of chunking
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-5
-    min_learning_rate: float = 1e-6
-    weight_decay: float = 0.0
-    warmup_steps: int = 500
+    learning_rate: float = 1e-4
+    min_learning_rate: float = 1e-5
+    weight_decay: float = 1e-5
     grad_clip: float = 1.0
 
-    # Distillation Parameters
-    kl_weight: float = 1.0  # Weight for KL divergence loss
-    ce_weight: float = 0.0  # Weight for cross-entropy loss (optional)
-    temperature: float = 1.0  # Temperature for softening distributions
-    chunk_size: int = 512  # Chunk size for memory-efficient loss calculation
+    # Distillation Hyperparameters
+    alpha: float = 0.5
+    temperature: float = 2.0
+    loss_chunk_size: int = 1024  # Chunk size for memory-efficient loss. 0 to disable.
+
+    # Performance & Mixed Precision
+    use_amp: bool = False
+    amp_dtype: str = "bfloat16"  # float16 or bfloat16
 
     # Logging and Saving
     log_interval: int = 10
@@ -71,529 +80,396 @@ class LogitsDistillationConfig:
     val_interval: int = 250
     val_batches: int = 10
 
-    # Mixed Precision
-    use_amp: bool = False
-    dtype: str = "bfloat16"  # float32, float16, bfloat16
+    # Student Model Configuration
+    factorization_rank: int = 16
+    layer_sharing: bool = False
 
 
-class DistillationTrainer:
-    """Handles the logits-based knowledge distillation training process."""
+@rank_zero_only
+def print0(s: str):
+    LOGGER.info(s)
 
-    def __init__(self, config: LogitsDistillationConfig):
+
+class TrainContext:
+    config: TrainingConfig
+    teacher_model: nn.Module
+    student_model: nn.Module | nn.parallel.DistributedDataParallel
+    optimizer: optim.Optimizer
+    scheduler: torch.optim.lr_scheduler.LRScheduler
+    train_loader: DistributedDataLoader
+    val_loader: DistributedDataLoader
+    scaler: torch.cuda.amp.GradScaler | None
+    device: torch.device
+    dtype: torch.dtype
+
+    def __init__(self, config: TrainingConfig):
         self.config = config
-        self.device = device_parse(config.device)
 
-        # Setup models
-        self.setup_models()
 
-        # Setup data
-        self.setup_data()
+def setup_models(state: TrainContext):
+    # (No changes from previous version)
+    teacher_config = TeacherModel.config_class.from_json_file(state.config.model_config_path)
+    teacher_model = TeacherModel(teacher_config)
+    checkpoint = safetensors.torch.load_file(state.config.model_weights_path)
+    csd = intersect_dicts(checkpoint, teacher_model.state_dict())
+    teacher_model.load_state_dict(csd, strict=False)
+    teacher_model.to(state.device)
+    teacher_model.eval()
+    teacher_model.requires_grad_(False)
+    print0(
+        f"Teacher model loaded with {sum(p.numel() for p in teacher_model.parameters()):,} parameters."
+    )
 
-        # Setup optimization
-        self.setup_optimization()
+    student_config = copy(teacher_config)
+    student_config.factorization_rank = state.config.factorization_rank
+    student_config.layer_sharing = state.config.layer_sharing
+    student_config.seq_length = state.config.seq_length
+    student_model = StudentModel(student_config)
 
-        # Metrics tracking
-        self.metrics = {
-            "distillation_loss": [],
-            "ce_loss": [],
-            "total_loss": [],
-            "perplexity": [],
-            "learning_rate": [],
-        }
+    student_model.load_state_dict(csd, strict=False)
+    student_model.to(state.device)
+    student_model.train()
+    print0(
+        f"Student model created with {sum(p.numel() for p in student_model.parameters()):,} parameters."
+    )
+    print0(
+        f"Total trainable parameters: {sum(p.numel() for p in student_model.parameters() if p.requires_grad):,}"
+    )
 
-        # Training state
-        self.global_step = 0
-        self.best_val_loss = float("inf")
+    if DDP_ENABLED:
+        dist.barrier()
+        student_model = DDP(student_model, device_ids=[LOCAL_RANK])
 
-    def setup_models(self):
-        """Initialize teacher and student models."""
-        LOGGER.info("Loading teacher model...")
+    return teacher_model, student_model
 
-        # Load teacher model
-        teacher_config = LlamaConfig.from_pretrained(self.config.teacher_config_path)
-        self.teacher = LlamaForCausalLM(teacher_config)
 
-        # Load teacher weights
-        teacher_state = safetensors.torch.load_file(self.config.teacher_weights_path)
-        self.teacher.load_state_dict(teacher_state, strict=True)
-        self.teacher.to(self.device)
-        self.teacher.eval()  # Teacher always in eval mode
+def setup_optimizer(state: TrainContext):
+    # (No changes from previous version)
+    model_to_optimize = de_parallel(state.student_model)
+    return optim.AdamW(
+        model_to_optimize.parameters(),
+        lr=state.config.learning_rate,
+        weight_decay=state.config.weight_decay,
+    )
 
-        # Freeze teacher parameters
-        for param in self.teacher.parameters():
-            param.requires_grad = False
 
-        LOGGER.info("Loading student model...")
+def setup_scheduler(state: TrainContext):
+    # (No changes from previous version)
+    return CosineAnnealingLR(
+        state.optimizer, T_max=state.config.max_steps, eta_min=state.config.min_learning_rate
+    )
 
-        # Load student model
-        student_config = LlamaConfig.from_pretrained(self.config.student_config_path)
-        self.student = LlamaForCausalLM(student_config)
 
-        # Load student weights if provided
-        if self.config.student_weights_path:
-            student_state = safetensors.torch.load_file(self.config.student_weights_path)
-            self.student.load_state_dict(student_state, strict=True)
+def setup_dataloaders(state: TrainContext):
+    # (No changes from previous version)
+    train_loader = DistributedDataLoader(
+        path=Path(state.config.data_path),
+        batch_size=state.config.batch_size,
+        seq_len=state.config.seq_length,
+        split="train",
+    )
+    val_loader = DistributedDataLoader(
+        path=Path(state.config.data_path),
+        batch_size=state.config.batch_size,
+        seq_len=state.config.seq_length,
+        split="val",
+    )
+    return train_loader, val_loader
+
+
+def calculate_loss(
+    state: TrainContext,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    targets: torch.Tensor,
+):
+    """Calculates combined loss, with optional memory-efficient chunking for KL term."""
+    # Cross-Entropy Loss
+    loss_ce = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), targets.view(-1))
+
+    # KL Divergence Distillation Loss
+    student_logits_flat = student_logits.view(-1, student_logits.size(-1))
+    teacher_logits_flat = teacher_logits.view(-1, teacher_logits.size(-1))
+
+    T = state.config.temperature
+
+    # Check if chunking is enabled and necessary
+    if (
+        state.config.loss_chunk_size > 0
+        and student_logits_flat.size(0) > state.config.loss_chunk_size
+    ):
+        # 🧠 Memory-efficient chunked computation
+        kl_loss = torch.tensor(0.0, device=state.device, dtype=student_logits.dtype)
+        num_tokens = student_logits_flat.size(0)
+
+        for i in range(0, num_tokens, state.config.loss_chunk_size):
+            end = i + state.config.loss_chunk_size
+            student_chunk = student_logits_flat[i:end]
+            teacher_chunk = teacher_logits_flat[i:end]
+
+            student_log_probs = F.log_softmax(student_chunk / T, dim=-1)
+            teacher_log_probs = F.log_softmax(teacher_chunk / T, dim=-1)
+
+            # Use log_target=True for efficiency, reduction='sum' to aggregate over chunks
+            chunk_kl = F.kl_div(
+                student_log_probs, teacher_log_probs, reduction="sum", log_target=True
+            )
+            kl_loss += chunk_kl
+
+        # Average the loss over all tokens
+        kl_loss /= num_tokens
+
+    else:
+        # Direct computation for smaller tensors
+        student_log_probs = F.log_softmax(student_logits_flat / T, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits_flat / T, dim=-1)
+        kl_loss = F.kl_div(
+            student_log_probs, teacher_log_probs, reduction="batchmean", log_target=True
+        )
+
+    loss_kl = kl_loss * (T**2)
+    alpha = state.config.alpha
+    combined_loss = alpha * loss_kl + (1.0 - alpha) * loss_ce
+
+    return combined_loss, loss_ce.item(), loss_kl.item()
+
+
+def training_step(state: TrainContext, batch, step: int):
+    """Performs a single training step, including forward and backward passes with AMP."""
+    x, y = batch
+    x, y = x.to(state.device), y.to(state.device)
+
+    # 🧠 Forward pass with AMP
+    with torch.autocast(
+        device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp
+    ):
+        with torch.no_grad():
+            teacher_logits = state.teacher_model(x).logits
+        student_logits = state.student_model(x).logits
+        loss, loss_ce, loss_kl = calculate_loss(state, student_logits, teacher_logits, y)
+
+    scaled_loss = loss / state.config.gradient_accumulation_steps
+
+    # 🧠 Backward pass with GradScaler
+    if state.scaler:
+        state.scaler.scale(scaled_loss).backward()
+    else:
+        scaled_loss.backward()
+
+    if (step + 1) % state.config.gradient_accumulation_steps == 0:
+        model_to_clip = de_parallel(state.student_model)
+
+        # 🧠 Unscale gradients before clipping
+        if state.scaler:
+            state.scaler.unscale_(state.optimizer)
+
+        torch.nn.utils.clip_grad_norm_(model_to_clip.parameters(), state.config.grad_clip)
+
+        # 🧠 Optimizer step with GradScaler
+        if state.scaler:
+            state.scaler.step(state.optimizer)
+            state.scaler.update()
         else:
-            LOGGER.info("Initializing student model with random weights")
+            state.optimizer.step()
 
-        self.student.to(self.device)
-        self.student.train()
+        state.scheduler.step()
+        state.optimizer.zero_grad()
 
-        # Setup DDP if needed
-        if DDP_ENABLED:
-            self.student = DDP(self.student, device_ids=[LOCAL_RANK])
-            # Note: Teacher doesn't need DDP as it's not being trained
+    return loss.item(), loss_ce, loss_kl
 
-        # Setup mixed precision
-        self.setup_mixed_precision()
 
-    def setup_mixed_precision(self):
-        """Configure mixed precision training if enabled."""
-        if self.config.use_amp:
-            dtype_map = {
-                "float16": torch.float16,
-                "bfloat16": torch.bfloat16,
-                "float32": torch.float32,
-            }
-            self.amp_dtype = dtype_map[self.config.dtype]
-            self.scaler = torch.cuda.amp.GradScaler(enabled=(self.config.dtype == "float16"))
-        else:
-            self.amp_dtype = torch.float32
-            self.scaler = None
+@torch.inference_mode()
+def validate(state: TrainContext):
+    """Runs the validation loop with AMP."""
+    state.student_model.eval()
+    total_loss, total_ce, total_kl = 0.0, 0.0, 0.0
 
-    def setup_data(self):
-        """Initialize data loaders."""
-        self.train_loader = DistributedDataLoader(
-            data_root=self.config.data_path,
-            batch_size=self.config.batch_size,
-            seq_length=self.config.seq_length,
-            split="train",
-        )
+    for _ in range(state.config.val_batches):
+        x, y = state.val_loader.next_batch()
+        x, y = x.to(state.device), y.to(state.device)
 
-        self.val_loader = DistributedDataLoader(
-            data_root=self.config.data_path,
-            batch_size=self.config.batch_size,
-            seq_length=self.config.seq_length,
-            split="val",
-        )
+        # 🧠 Forward pass with AMP context for validation
+        with torch.autocast(
+            device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp
+        ):
+            teacher_logits = state.teacher_model(x).logits
+            student_logits = state.student_model(x).logits
+            loss, loss_ce, loss_kl = calculate_loss(state, student_logits, teacher_logits, y)
 
-    def setup_optimization(self):
-        """Initialize optimizer and scheduler."""
-        # Get student parameters
-        params = self.student.parameters()
+        total_loss += loss.item()
+        total_ce += loss_ce
+        total_kl += loss_kl
 
-        # Optimizer
-        self.optimizer = optim.AdamW(
-            params,
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-        )
+    state.student_model.train()
 
-        # Learning rate scheduler
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=self.config.max_steps, eta_min=self.config.min_learning_rate
-        )
+    if DDP_ENABLED:
+        total_losses_tensor = torch.tensor([total_loss, total_ce, total_kl], device=state.device)
+        dist.all_reduce(total_losses_tensor, op=dist.ReduceOp.SUM)
+        total_loss, total_ce, total_kl = total_losses_tensor.tolist()
 
-    def compute_distillation_loss(
-        self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        Compute the distillation loss using KL divergence.
+    avg_loss = total_loss / (state.config.val_batches * WORLD_SIZE)
+    avg_ce = total_ce / (state.config.val_batches * WORLD_SIZE)
+    avg_kl = total_kl / (state.config.val_batches * WORLD_SIZE)
 
-        Args:
-            student_logits: Logits from student model [batch_size, seq_len, vocab_size]
-            teacher_logits: Logits from teacher model [batch_size, seq_len, vocab_size]
-            labels: Optional labels for CE loss [batch_size, seq_len]
+    return avg_loss, avg_ce, avg_kl
 
-        Returns:
-            total_loss: Combined distillation and CE loss
-            loss_dict: Dictionary with individual loss components
-        """
-        # Reshape logits for loss calculation
-        batch_size, seq_len, vocab_size = student_logits.shape
-        student_logits_flat = student_logits.view(-1, vocab_size)
-        teacher_logits_flat = teacher_logits.view(-1, vocab_size)
 
-        # Apply temperature scaling
-        student_logits_scaled = student_logits_flat / self.config.temperature
-        teacher_logits_scaled = teacher_logits_flat / self.config.temperature
+@rank_zero_only
+def save_checkpoint(state, step):
+    """Saves a robust checkpoint for resuming training."""
+    model_to_save = de_parallel(state.student_model)
+    ckpt_dir = Path(state.config.checkpoint_dir)
+    ckpt_dir.mkdir(exist_ok=True)
+    ckpt_path = ckpt_dir / f"checkpoint_step_{step}.pt"
 
-        # Compute KL divergence loss
-        if self.config.chunk_size and student_logits_flat.size(0) > self.config.chunk_size:
-            # Memory-efficient chunked computation
-            kl_loss = torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
-            num_chunks = 0
+    # 🧠 Save all necessary states for a full resume
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model_to_save.state_dict(),
+            "optimizer_state_dict": state.optimizer.state_dict(),
+            "scheduler_state_dict": state.scheduler.state_dict(),
+            "scaler_state_dict": state.scaler.state_dict() if state.scaler else None,
+            "config": state.config,
+        },
+        ckpt_path,
+    )
 
-            for i in range(0, student_logits_flat.size(0), self.config.chunk_size):
-                end_idx = min(i + self.config.chunk_size, student_logits_flat.size(0))
+    LOGGER.info(f"Saved checkpoint to {ckpt_path}")
 
-                student_chunk = student_logits_scaled[i:end_idx]
-                teacher_chunk = teacher_logits_scaled[i:end_idx]
 
-                # KL(P||Q) where P is teacher, Q is student
-                student_log_probs = F.log_softmax(student_chunk, dim=-1)
-                teacher_log_probs = F.log_softmax(teacher_chunk, dim=-1)
+def load_checkpoint(state: TrainContext) -> int:
+    """Loads a checkpoint to resume training."""
+    start_step = 0
+    ckpt_path = state.config.resume_from_checkpoint
+    if ckpt_path and Path(ckpt_path).exists():
+        print0(f"Resuming training from checkpoint: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=state.device)
 
-                chunk_kl = F.kl_div(
-                    student_log_probs, teacher_log_probs, log_target=True, reduction="sum"
+        # Load model weights
+        model_to_load = de_parallel(state.student_model)
+        model_to_load.load_state_dict(checkpoint["model_state_dict"])
+
+        # Load optimizer and scheduler states
+        state.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        state.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        # Load GradScaler state if it exists
+        if (
+            state.scaler
+            and "scaler_state_dict" in checkpoint
+            and checkpoint["scaler_state_dict"] is not None
+        ):
+            state.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        start_step = checkpoint["step"]
+        print0(f"Successfully resumed from step {start_step}.")
+    else:
+        print0("Starting training from scratch.")
+
+    return start_step
+
+
+def train(state: TrainContext):
+    """The main training loop with integrated AMP and resuming."""
+    if DDP_ENABLED:
+        dist.init_process_group(backend="nccl")
+        state.device = torch.device(f"cuda:{LOCAL_RANK}")
+        torch.cuda.set_device(state.device)
+    else:
+        state.device = device_parse(state.config.device)
+
+    # 🧠 Setup AMP dtype and GradScaler
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+    state.dtype = dtype_map.get(state.config.amp_dtype, torch.float32)
+    use_cuda_for_amp = state.device.type == "cuda" and state.config.use_amp
+    state.scaler = torch.cuda.amp.GradScaler(
+        enabled=use_cuda_for_amp and state.dtype == torch.float16
+    )
+
+    print0(
+        f"Using device: {state.device}, AMP enabled: {state.config.use_amp}, DType: {state.dtype}"
+    )
+
+    state.teacher_model, state.student_model = setup_models(state)
+    state.optimizer = setup_optimizer(state)
+    state.scheduler = setup_scheduler(state)
+    state.train_loader, state.val_loader = setup_dataloaders(state)
+
+    # 🧠 Load checkpoint if specified and get start step
+    start_step = load_checkpoint(state)
+
+    print0("Starting training...")
+    state.optimizer.zero_grad()
+
+    running_loss, running_ce, running_kl = 0.0, 0.0, 0.0
+    start_time = time.time()
+
+    # 🧠 Loop starts from `start_step`
+    for step in range(start_step, state.config.max_steps):
+        batch = state.train_loader.next_batch()
+        loss, loss_ce, loss_kl = training_step(state, batch, step)
+        running_loss += loss
+        running_ce += loss_ce
+        running_kl += loss_kl
+
+        if (step + 1) % state.config.log_interval == 0:
+            if LOCAL_RANK in {-1, 0}:
+                # The logic here remains the same, just reporting the results
+                # of the more efficient training step.
+                avg_loss = running_loss / state.config.log_interval
+                avg_ce = running_ce / state.config.log_interval
+                avg_kl = running_kl / state.config.log_interval
+                elapsed = time.time() - start_time
+                tokens_per_sec = (
+                    state.config.batch_size
+                    * state.config.seq_length
+                    * state.config.log_interval
+                    * WORLD_SIZE
+                ) / elapsed
+                print0(
+                    f"Step {step + 1}/{state.config.max_steps} | "
+                    f"Loss: {avg_loss:.4f} (CE: {avg_ce:.4f}, KL: {avg_kl:.4f}) | "
+                    f"LR: {state.scheduler.get_last_lr()[0]:.2e} | "
+                    f"Tokens/s: {tokens_per_sec:.0f}"
                 )
+                running_loss, running_ce, running_kl = 0.0, 0.0, 0.0
+                start_time = time.time()
 
-                kl_loss = kl_loss + chunk_kl
-                num_chunks += end_idx - i
+        if (step + 1) % state.config.val_interval == 0:
+            val_loss, val_ce, val_kl = validate(state)
+            print0(f"Validation Loss: {val_loss:.4f} (CE: {val_ce:.4f}, KL: {val_kl:.4f})")
 
-            kl_loss = kl_loss / num_chunks
-        else:
-            # Direct computation for smaller batches
-            student_log_probs = F.log_softmax(student_logits_scaled, dim=-1)
-            teacher_log_probs = F.log_softmax(teacher_logits_scaled, dim=-1)
+        if (step + 1) % state.config.save_interval == 0:
+            save_checkpoint(state, step + 1)
 
-            kl_loss = F.kl_div(
-                student_log_probs, teacher_log_probs, log_target=True, reduction="batchmean"
-            )
-
-        # Scale KL loss by temperature squared (as per standard distillation)
-        kl_loss = kl_loss * (self.config.temperature**2)
-
-        # Compute optional CE loss
-        ce_loss = torch.tensor(0.0, device=student_logits.device)
-        if self.config.ce_weight > 0 and labels is not None:
-            labels_flat = labels.view(-1)
-            # Ignore padding tokens (typically -100)
-            ce_loss = F.cross_entropy(
-                student_logits_flat, labels_flat, ignore_index=-100, reduction="mean"
-            )
-
-        # Combine losses
-        total_loss = self.config.kl_weight * kl_loss + self.config.ce_weight * ce_loss
-
-        loss_dict = {
-            "kl_loss": kl_loss.item(),
-            "ce_loss": ce_loss.item(),
-            "total_loss": total_loss.item(),
-        }
-
-        return total_loss, loss_dict
-
-    def training_step(self, batch: dict) -> dict:
-        """Execute a single training step."""
-        input_ids = batch["input_ids"].to(self.device)
-        labels = batch.get("labels", input_ids.clone())
-
-        # Forward pass with mixed precision
-        with torch.cuda.amp.autocast(enabled=self.config.use_amp, dtype=self.amp_dtype):
-            # Get teacher logits (no grad needed)
-            with torch.no_grad():
-                teacher_outputs = self.teacher(input_ids=input_ids, use_cache=False)
-                teacher_logits = teacher_outputs.logits
-
-            # Get student logits
-            student_outputs = self.student(input_ids=input_ids, use_cache=False)
-            student_logits = student_outputs.logits
-
-            # Compute distillation loss
-            loss, loss_dict = self.compute_distillation_loss(
-                student_logits, teacher_logits, labels if self.config.ce_weight > 0 else None
-            )
-
-        # Scale loss for gradient accumulation
-        loss = loss / self.config.gradient_accumulation_steps
-
-        # Backward pass
-        if self.config.use_amp and self.scaler is not None:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        return loss_dict
-
-    @torch.no_grad()
-    def validation_step(self, batch: dict) -> dict:
-        """Execute a single validation step."""
-        input_ids = batch["input_ids"].to(self.device)
-        labels = batch.get("labels", input_ids.clone())
-
-        # Forward pass
-        with torch.cuda.amp.autocast(enabled=self.config.use_amp, dtype=self.amp_dtype):
-            # Get teacher logits
-            teacher_outputs = self.teacher(input_ids=input_ids, use_cache=False)
-            teacher_logits = teacher_outputs.logits
-
-            # Get student logits
-            student_outputs = self.student(input_ids=input_ids, use_cache=False)
-            student_logits = student_outputs.logits
-
-            # Compute distillation loss
-            loss, loss_dict = self.compute_distillation_loss(
-                student_logits, teacher_logits, labels if self.config.ce_weight > 0 else None
-            )
-
-        # Calculate perplexity
-        if self.config.ce_weight > 0:
-            perplexity = torch.exp(torch.tensor(loss_dict["ce_loss"]))
-            loss_dict["perplexity"] = perplexity.item()
-        else:
-            # Estimate perplexity from KL loss
-            loss_dict["perplexity"] = 0.0
-
-        return loss_dict
-
-    def train(self):
-        """Main training loop."""
-        LOGGER.info(f"Starting training for {self.config.max_steps} steps")
-
-        train_losses = []
-        grad_accum_counter = 0
-
-        for step in range(self.config.max_steps):
-            self.global_step = step
-
-            # Training step
-            batch = next(self.train_loader)
-            loss_dict = self.training_step(batch)
-            train_losses.append(loss_dict)
-
-            grad_accum_counter += 1
-
-            # Optimizer step
-            if grad_accum_counter == self.config.gradient_accumulation_steps:
-                # Gradient clipping
-                if self.config.grad_clip > 0:
-                    if self.config.use_amp and self.scaler is not None:
-                        self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.student.parameters(), self.config.grad_clip
-                    )
-
-                # Optimizer step
-                if self.config.use_amp and self.scaler is not None:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-
-                self.scheduler.step()
-                self.optimizer.zero_grad()
-                grad_accum_counter = 0
-
-            # Logging
-            if step % self.config.log_interval == 0 and step > 0:
-                avg_losses = {
-                    k: sum(d[k] for d in train_losses) / len(train_losses)
-                    for k in train_losses[0].keys()
-                }
-
-                lr = self.scheduler.get_last_lr()[0]
-
-                LOGGER.info(
-                    f"Step {step}/{self.config.max_steps} | "
-                    f"KL Loss: {avg_losses['kl_loss']:.4f} | "
-                    f"CE Loss: {avg_losses['ce_loss']:.4f} | "
-                    f"Total Loss: {avg_losses['total_loss']:.4f} | "
-                    f"LR: {lr:.2e}"
-                )
-
-                train_losses = []
-
-            # Validation
-            if step % self.config.val_interval == 0 and step > 0:
-                self.validate()
-
-            # Checkpoint saving
-            if step % self.config.save_interval == 0 and step > 0:
-                self.save_checkpoint(step)
-
-        LOGGER.info("Training completed!")
-
-    @torch.no_grad()
-    def validate(self):
-        """Run validation loop."""
-        self.student.eval()
-
-        val_losses = []
-        for i in range(self.config.val_batches):
-            batch = next(self.val_loader)
-            loss_dict = self.validation_step(batch)
-            val_losses.append(loss_dict)
-
-        # Average validation metrics
-        avg_losses = {
-            k: sum(d[k] for d in val_losses) / len(val_losses) for k in val_losses[0].keys()
-        }
-
-        LOGGER.info(
-            f"Validation | "
-            f"KL Loss: {avg_losses['kl_loss']:.4f} | "
-            f"CE Loss: {avg_losses['ce_loss']:.4f} | "
-            f"Total Loss: {avg_losses['total_loss']:.4f} | "
-            f"Perplexity: {avg_losses.get('perplexity', 0):.2f}"
-        )
-
-        # Save best model
-        if avg_losses["total_loss"] < self.best_val_loss:
-            self.best_val_loss = avg_losses["total_loss"]
-            self.save_checkpoint("best")
-
-        self.student.train()
-
-    @rank_zero_only
-    def save_checkpoint(self, tag: str):
-        """Save model checkpoint."""
-        checkpoint_dir = Path(self.config.checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        # Get model state dict
-        student_state = de_parallel(self.student).state_dict()
-
-        # Save checkpoint
-        checkpoint = {
-            "model_state_dict": student_state,
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "global_step": self.global_step,
-            "config": self.config,
-            "best_val_loss": self.best_val_loss,
-        }
-
-        checkpoint_path = checkpoint_dir / f"checkpoint_{tag}.pt"
-        torch.save(checkpoint, checkpoint_path)
-        LOGGER.info(f"Saved checkpoint to {checkpoint_path}")
-
-        # Also save model weights in safetensors format
-        safetensors_path = checkpoint_dir / f"model_{tag}.safetensors"
-        safetensors.torch.save_file(student_state, safetensors_path)
-        LOGGER.info(f"Saved model weights to {safetensors_path}")
-
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
-        de_parallel(self.student).load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        self.global_step = checkpoint["global_step"]
-        self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-
-        LOGGER.info(f"Loaded checkpoint from {checkpoint_path}")
-        LOGGER.info(f"Resuming from step {self.global_step}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Logits-based Knowledge Distillation")
-
-    # Model paths
-    parser.add_argument(
-        "--teacher_config",
-        type=str,
-        default="data/MobileLLM/config.json",
-        help="Path to teacher model config",
-    )
-    parser.add_argument(
-        "--teacher_weights",
-        type=str,
-        default="data/MobileLLM/model.safetensors",
-        help="Path to teacher model weights",
-    )
-    parser.add_argument(
-        "--student_config",
-        type=str,
-        default="data/MobileLLM/config.json",
-        help="Path to student model config",
-    )
-    parser.add_argument(
-        "--student_weights",
-        type=str,
-        default=None,
-        help="Path to student model weights (optional)",
-    )
-
-    # Training parameters
-    parser.add_argument("--max_steps", type=int, default=50000, help="Maximum training steps")
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size per device")
-    parser.add_argument("--seq_length", type=int, default=512, help="Sequence length")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Initial learning rate")
-    parser.add_argument(
-        "--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps"
-    )
-
-    # Distillation parameters
-    parser.add_argument(
-        "--kl_weight", type=float, default=1.0, help="Weight for KL divergence loss"
-    )
-    parser.add_argument(
-        "--ce_weight", type=float, default=0.0, help="Weight for cross-entropy loss"
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=1.0, help="Temperature for distillation"
-    )
-    parser.add_argument(
-        "--chunk_size",
-        type=int,
-        default=512,
-        help="Chunk size for memory-efficient loss calculation",
-    )
-
-    # Other parameters
-    parser.add_argument(
-        "--data_path", type=str, default="data/edu_fineweb10B", help="Path to training data"
-    )
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="checkpoints/logits_distillation",
-        help="Directory for saving checkpoints",
-    )
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use for training")
-    parser.add_argument("--use_amp", action="store_true", help="Use automatic mixed precision")
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="bfloat16",
-        choices=["float32", "float16", "bfloat16"],
-        help="Data type for mixed precision",
-    )
-    parser.add_argument(
-        "--resume", type=str, default=None, help="Path to checkpoint to resume from"
-    )
-
-    args = parser.parse_args()
-
-    # Create config from arguments
-    config = LogitsDistillationConfig(
-        teacher_config_path=args.teacher_config,
-        teacher_weights_path=args.teacher_weights,
-        student_config_path=args.student_config,
-        student_weights_path=args.student_weights,
-        data_path=args.data_path,
-        checkpoint_dir=args.checkpoint_dir,
-        device=args.device,
-        max_steps=args.max_steps,
-        batch_size=args.batch_size,
-        seq_length=args.seq_length,
-        gradient_accumulation_steps=args.grad_accum_steps,
-        learning_rate=args.learning_rate,
-        kl_weight=args.kl_weight,
-        ce_weight=args.ce_weight,
-        temperature=args.temperature,
-        chunk_size=args.chunk_size,
-        use_amp=args.use_amp,
-        dtype=args.dtype,
-    )
-
-    # Initialize trainer
-    trainer = DistillationTrainer(config)
-
-    # Load checkpoint if resuming
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
-
-    # Start training
-    trainer.train()
+    print0("Training completed!")
+    if DDP_ENABLED:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Train a student LLaMA model via full model distillation with advanced features."
+    )
+
+    # Dynamically add arguments from the TrainingConfig dataclass
+    for field in fields(TrainingConfig):
+        if field.type == bool:
+            parser.add_argument(
+                f"--{field.name.replace('_', '-')}",
+                action="store_true",
+                help=f"Enable {field.name}",
+            )
+        else:
+            parser.add_argument(
+                f"--{field.name.replace('_', '-')}",
+                type=field.type,
+                default=field.default,
+                help=f"Default: {field.default}",
+            )
+
+    args = parser.parse_args()
+    train_config = TrainingConfig(**vars(args))
+    state = TrainContext(train_config)
+    train(state)
