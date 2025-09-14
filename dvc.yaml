@@ -1,18 +1,72 @@
 stages:
   download_data:
-    cmd: uv run scripts/dataset_hf_to_bin.py --dataset "JeanKaddour/minipile" --output-dir "data/minipile" --hf-token $HF_TOKEN
+    cmd: uv run scripts/dataset_hf_to_bin.py --dataset "JeanKaddour/minipile" --output-dir "data/minipile" --split "train" && \
+         uv run scripts/dataset_hf_to_bin.py --dataset "JeanKaddour/minipile" --output-dir "data/minipile" --split "test"
     deps:
       - scripts/dataset_hf_to_bin.py
     outs:
       - data/minipile
   distill_first_phase:
-    cmd: torchrun --nproc_per_node=2 scripts/distill_full_model.py \
-          --model_config_path "data/MobileLLM/config.json" \
-          --model_weights_path "data/MobileLLM/model.safetensors" \
-          --data_path "data/edu_fineweb10B" \
-          --checkpoint_dir "checkpoints/full_model_distill_ddp" \
-          --batch_size 4 \
-          --learning_rate 1e-4 \
+    cmd: python scripts/distill_individual_layers.py \
+          --model_config_path 'data/MobileLLM/config.json' \
+          --model_weights_path 'data/MobileLLM/model.safetensors' \
+          --data_path 'data/minipile' \
+          --checkpoint_dir 'checkpoints' \
+          --device 'cuda' \
+          --max_steps 1000 \
+          --batch_size 32 \
+          --seq_length 512 \
+          --gradient_accumulation_steps 4 \
+          --learning_rate 1e-3 \
+          --min_learning_rate 1e-5 \
+          --weight_decay 1e-5 \
+          --warmup_steps 100 \
+          --grad_clip 1.0 \
+          --log_interval 10 \
+          --save_interval 100 \
+          --val_interval 250 \
+          --val_batches 10 \
+          --factorization_rank 16 \
+          --layer_sharing
+    deps:
+      - scripts/distill_individual_layers.py
+      - data/MobileLLM/config.json
+      - data/MobileLLM/model.safetensors
+      - data/minipile
+    outs:
+      - checkpoints
+  distill_second_phase:
+    cmd: python scripts/distill_whole_model.py \
+          --model-config-path 'data/MobileLLM/config.json' \
+          --model-weights-path 'data/MobileLLM/model.safetensors' \
+          --data-path 'data/minipile' \
+          --checkpoint-dir 'checkpoints_full_model' \
+          --from_checkpoint 'checkpoints/checkpoint_step_1001.pt' \
+          --device 'cuda' \
+          --max-steps 20000 \
+          --batch-size 2 \
+          --seq-length 512 \
+          --gradient-accumulation-steps 4 \
+          --learning-rate 1e-4 \
+          --min-learning-rate 1e-5 \
+          --weight-decay 1e-5 \
+          --grad-clip 1.0 \
           --alpha 0.5 \
           --temperature 2.0 \
-          --device "cuda" # Device is handled by DDP, just specify the backend
+          --loss-chunk-size 1024 \
+          --use-amp \
+          --amp-dtype 'bfloat16' \
+          --log-interval 10 \
+          --save-interval 1000 \
+          --val-interval 250 \
+          --val-batches 10 \
+          --factorization-rank 16 \
+          --layer-sharing
+    deps:
+      - scripts/distill_whole_model.py
+      - data/MobileLLM/config.json
+      - data/MobileLLM/model.safetensors
+      - data/minipile
+      - checkpoints/checkpoint_step_1001.pt
+    outs:
+      - checkpoints_full_model

@@ -19,14 +19,96 @@ from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
 from transformers import LlamaConfig
 import safetensors
 from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherModel
-from attention_approximation.modeling_llama_approximated import LlamaApproximatedAttention
 from attention_approximation.pytorch import device_parse, intersect_dicts, WORLD_SIZE, LOCAL_RANK, RANK, rank_zero_only, de_parallel
 from attention_approximation.utils import LOGGER
 from attention_approximation.data import DistributedDataLoader
-import numpy as np
 
 
 DDP_ENABLED = WORLD_SIZE > 1
+
+
+class CP(nn.Module):
+    def __init__(self, rank: int, out_units: int = 1):
+        super().__init__()
+        self.rank = int(rank)
+        self.out_units = int(out_units)
+        self.weight = nn.Parameter(torch.ones(self.out_units, self.rank), requires_grad=False)
+
+    def forward(self, hadamard: torch.Tensor) -> torch.Tensor:
+        return hadamard @ self.weight.t()
+
+
+class CPCircuitLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, chunk_size: int = 1_000):
+        super().__init__()
+        self.out_units = 1
+        self.rank = config.factorization_rank
+        self.chunk_size = chunk_size
+
+        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias)
+        self.hidden_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias)
+
+        self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
+
+    def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, hidden_size = hidden_states.size()
+        device = hidden_states.device
+
+        # Convert indices to device if needed
+        all_indices = all_indices.to(device)
+
+        # Compute embeddings for each mode
+        # seq_mode: [batch, seq_len, rank]
+        seq_embeddings = self.seq_mode_factor(hidden_states)
+
+        # For hidden mode, we need to transpose and apply the linear layer
+        # hidden_states: [batch, seq_len, hidden_size] -> [batch, hidden_size, seq_len]
+        hidden_transposed = hidden_states.transpose(1, 2)
+        # hidden_mode: [batch, hidden_size, rank]
+        hidden_embeddings = self.hidden_mode_factor(hidden_transposed)
+
+        outputs = []
+        for start in range(0, all_indices.size(0), self.chunk_size):
+            end = min(start + self.chunk_size, all_indices.size(0))
+            chunk = all_indices[start:end]  # [chunk_size, 2]
+
+            # Get indices for each mode
+            seq_indices = chunk[:, 0].long()  # [chunk_size]
+            hidden_indices = chunk[:, 1].long()  # [chunk_size]
+
+            # Expand for batch dimension
+            seq_indices = seq_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
+            hidden_indices = hidden_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
+
+            # Index into embeddings
+            # seq_embeddings: [batch, seq_len, rank]
+            seq_indices_expanded = seq_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
+            seq_emb = torch.gather(seq_embeddings, dim=1, index=seq_indices_expanded)  # [batch, chunk_size, rank]
+
+            # hidden_embeddings: [batch, hidden_size, rank]
+            hidden_indices_expanded = hidden_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
+            hidden_emb = torch.gather(hidden_embeddings, dim=1, index=hidden_indices_expanded)  # [batch, chunk_size, rank]
+
+            # Compute hadamard product
+            hadamard = seq_emb * hidden_emb  # [batch, chunk_size, rank]
+
+            # Apply CP decomposition
+            out_chunk = self.cp(hadamard)  # [batch, chunk_size, out_units]
+            outputs.append(out_chunk)
+
+        out = torch.cat(outputs, dim=1)  # [batch, total_size, out_units]
+        return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
+
+class LlamaApproximatedAttention(nn.Module):
+    def __init__(self, config: LlamaConfig, all_indices: torch.Tensor):
+        super().__init__()
+        self.all_indices = all_indices
+        self.cp_circuit = CPCircuitLayer(config=config, chunk_size=10_000)
+
+    def forward(self, hidden_states: torch.Tensor, **kargs) -> torch.Tensor:
+        attn_output = self.cp_circuit(hidden_states, self.all_indices)
+        return  attn_output
+
 
 @dataclass
 class TrainingConfig:
@@ -353,27 +435,3 @@ if __name__ == "__main__":
     state = TrainContext(train_config)
     train(state)
 
-
-""""
-python scripts/distill_individual_layers.py \
-    --model_config_path 'data/MobileLLM/config.json' \
-    --model_weights_path 'data/MobileLLM/model.safetensors' \
-    --data_path 'data/minipile' \
-    --checkpoint_dir 'checkpoints' \
-    --device 'cuda' \
-    --max_steps 1000 \
-    --batch_size 32 \
-    --seq_length 512 \
-    --gradient_accumulation_steps 4 \
-    --learning_rate 1e-3 \
-    --min_learning_rate 1e-5 \
-    --weight_decay 1e-5 \
-    --warmup_steps 100 \
-    --grad_clip 1.0 \
-    --log_interval 10 \
-    --save_interval 100 \
-    --val_interval 250 \
-    --val_batches 10 \
-    --factorization_rank 16 \
-    --layer_sharing
-"""

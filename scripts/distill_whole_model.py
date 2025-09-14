@@ -47,13 +47,13 @@ DDP_ENABLED = WORLD_SIZE > 1
 @dataclass
 class TrainingConfig:
     """Stores all hyperparameters and configuration settings."""
-
+    from_checkpoint: str
     # Model and Data Paths
     model_config_path: str = "data/MobileLLM/config.json"
     model_weights_path: str = "data/MobileLLM/model.safetensors"
     data_path: str = "data/edu_fineweb10B"
     checkpoint_dir: str = "checkpoints_full_model"
-    resume_from_checkpoint: str | None = None  # Path to a checkpoint to resume from
+    device: str = "cuda"  # or "cpu", user can override
 
     # Training Hyperparameters
     max_steps: int = 20000
@@ -110,15 +110,13 @@ def setup_models(state: TrainContext):
     # (No changes from previous version)
     teacher_config = TeacherModel.config_class.from_json_file(state.config.model_config_path)
     teacher_model = TeacherModel(teacher_config)
-    checkpoint = safetensors.torch.load_file(state.config.model_weights_path)
-    csd = intersect_dicts(checkpoint, teacher_model.state_dict())
+    ckpt = safetensors.torch.load_file(state.config.model_weights_path)
+    csd = intersect_dicts(ckpt, teacher_model.state_dict())
     teacher_model.load_state_dict(csd, strict=False)
     teacher_model.to(state.device)
-    teacher_model.eval()
     teacher_model.requires_grad_(False)
-    print0(
-        f"Teacher model loaded with {sum(p.numel() for p in teacher_model.parameters()):,} parameters."
-    )
+    teacher_model.eval()
+    print0(f"Transferred {len(csd)}/{len(teacher_model.state_dict())} items from pretrained weights")
 
     student_config = copy(teacher_config)
     student_config.factorization_rank = state.config.factorization_rank
@@ -126,15 +124,18 @@ def setup_models(state: TrainContext):
     student_config.seq_length = state.config.seq_length
     student_model = StudentModel(student_config)
 
+    ckpt = torch.load(state.config.from_checkpoint, map_location="cpu")['model_state_dict']
+    def rename_key(key):
+        key = key.replace("model.", "")
+        key = key.replace(".self_attn.student_att.", ".self_attn.")
+        return key
+
+    ckpt = {rename_key(k) : v for k, v in ckpt.items()}
+    csd = intersect_dicts(ckpt, student_model.state_dict())
     student_model.load_state_dict(csd, strict=False)
     student_model.to(state.device)
     student_model.train()
-    print0(
-        f"Student model created with {sum(p.numel() for p in student_model.parameters()):,} parameters."
-    )
-    print0(
-        f"Total trainable parameters: {sum(p.numel() for p in student_model.parameters() if p.requires_grad):,}"
-    )
+    LOGGER.info(f"Transferred {len(csd)}/{len(student_model.state_dict())} items from pretrained weights")
 
     if DDP_ENABLED:
         dist.barrier()
@@ -198,7 +199,7 @@ def calculate_loss(
         state.config.loss_chunk_size > 0
         and student_logits_flat.size(0) > state.config.loss_chunk_size
     ):
-        # 🧠 Memory-efficient chunked computation
+        # Memory-efficient chunked computation
         kl_loss = torch.tensor(0.0, device=state.device, dtype=student_logits.dtype)
         num_tokens = student_logits_flat.size(0)
 
@@ -239,18 +240,18 @@ def training_step(state: TrainContext, batch, step: int):
     x, y = batch
     x, y = x.to(state.device), y.to(state.device)
 
-    # 🧠 Forward pass with AMP
+    # Forward pass with AMP
     with torch.autocast(
         device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp
     ):
-        with torch.no_grad():
+        with torch.inference_mode():
             teacher_logits = state.teacher_model(x).logits
         student_logits = state.student_model(x).logits
         loss, loss_ce, loss_kl = calculate_loss(state, student_logits, teacher_logits, y)
 
     scaled_loss = loss / state.config.gradient_accumulation_steps
 
-    # 🧠 Backward pass with GradScaler
+    # Backward pass with GradScaler
     if state.scaler:
         state.scaler.scale(scaled_loss).backward()
     else:
@@ -259,13 +260,13 @@ def training_step(state: TrainContext, batch, step: int):
     if (step + 1) % state.config.gradient_accumulation_steps == 0:
         model_to_clip = de_parallel(state.student_model)
 
-        # 🧠 Unscale gradients before clipping
+        # Unscale gradients before clipping
         if state.scaler:
             state.scaler.unscale_(state.optimizer)
 
         torch.nn.utils.clip_grad_norm_(model_to_clip.parameters(), state.config.grad_clip)
 
-        # 🧠 Optimizer step with GradScaler
+        # Optimizer step with GradScaler
         if state.scaler:
             state.scaler.step(state.optimizer)
             state.scaler.update()
@@ -288,10 +289,8 @@ def validate(state: TrainContext):
         x, y = state.val_loader.next_batch()
         x, y = x.to(state.device), y.to(state.device)
 
-        # 🧠 Forward pass with AMP context for validation
-        with torch.autocast(
-            device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp
-        ):
+        # Forward pass with AMP context for validation
+        with torch.autocast(device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp):
             teacher_logits = state.teacher_model(x).logits
             student_logits = state.student_model(x).logits
             loss, loss_ce, loss_kl = calculate_loss(state, student_logits, teacher_logits, y)
@@ -322,7 +321,7 @@ def save_checkpoint(state, step):
     ckpt_dir.mkdir(exist_ok=True)
     ckpt_path = ckpt_dir / f"checkpoint_step_{step}.pt"
 
-    # 🧠 Save all necessary states for a full resume
+    # Save all necessary states for a full resume
     torch.save(
         {
             "step": step,
@@ -338,38 +337,6 @@ def save_checkpoint(state, step):
     LOGGER.info(f"Saved checkpoint to {ckpt_path}")
 
 
-def load_checkpoint(state: TrainContext) -> int:
-    """Loads a checkpoint to resume training."""
-    start_step = 0
-    ckpt_path = state.config.resume_from_checkpoint
-    if ckpt_path and Path(ckpt_path).exists():
-        print0(f"Resuming training from checkpoint: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=state.device)
-
-        # Load model weights
-        model_to_load = de_parallel(state.student_model)
-        model_to_load.load_state_dict(checkpoint["model_state_dict"])
-
-        # Load optimizer and scheduler states
-        state.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        state.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-        # Load GradScaler state if it exists
-        if (
-            state.scaler
-            and "scaler_state_dict" in checkpoint
-            and checkpoint["scaler_state_dict"] is not None
-        ):
-            state.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
-        start_step = checkpoint["step"]
-        print0(f"Successfully resumed from step {start_step}.")
-    else:
-        print0("Starting training from scratch.")
-
-    return start_step
-
-
 def train(state: TrainContext):
     """The main training loop with integrated AMP and resuming."""
     if DDP_ENABLED:
@@ -379,25 +346,18 @@ def train(state: TrainContext):
     else:
         state.device = device_parse(state.config.device)
 
-    # 🧠 Setup AMP dtype and GradScaler
+    # Setup AMP dtype and GradScaler
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
     state.dtype = dtype_map.get(state.config.amp_dtype, torch.float32)
     use_cuda_for_amp = state.device.type == "cuda" and state.config.use_amp
-    state.scaler = torch.cuda.amp.GradScaler(
-        enabled=use_cuda_for_amp and state.dtype == torch.float16
-    )
-
-    print0(
-        f"Using device: {state.device}, AMP enabled: {state.config.use_amp}, DType: {state.dtype}"
-    )
+    state.scaler = torch.amp.GradScaler(enabled=use_cuda_for_amp and state.dtype == torch.float16)
+    print0(f"Using device: {state.device}, AMP enabled: {state.config.use_amp}, DType: {state.dtype}")
 
     state.teacher_model, state.student_model = setup_models(state)
     state.optimizer = setup_optimizer(state)
     state.scheduler = setup_scheduler(state)
     state.train_loader, state.val_loader = setup_dataloaders(state)
 
-    # 🧠 Load checkpoint if specified and get start step
-    start_step = load_checkpoint(state)
 
     print0("Starting training...")
     state.optimizer.zero_grad()
@@ -405,8 +365,8 @@ def train(state: TrainContext):
     running_loss, running_ce, running_kl = 0.0, 0.0, 0.0
     start_time = time.time()
 
-    # 🧠 Loop starts from `start_step`
-    for step in range(start_step, state.config.max_steps):
+    # Loop starts from `start_step`
+    for step in range(state.config.max_steps):
         batch = state.train_loader.next_batch()
         loss, loss_ce, loss_kl = training_step(state, batch, step)
         running_loss += loss
@@ -449,25 +409,44 @@ def train(state: TrainContext):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Train a student LLaMA model via full model distillation with advanced features."
-    )
+    parser = argparse.ArgumentParser(description="Train a student LLaMA model via full model distillation with advanced features.")
 
-    # Dynamically add arguments from the TrainingConfig dataclass
-    for field in fields(TrainingConfig):
-        if field.type == bool:
-            parser.add_argument(
-                f"--{field.name.replace('_', '-')}",
-                action="store_true",
-                help=f"Enable {field.name}",
-            )
-        else:
-            parser.add_argument(
-                f"--{field.name.replace('_', '-')}",
-                type=field.type,
-                default=field.default,
-                help=f"Default: {field.default}",
-            )
+    # Model and Data Paths
+    parser.add_argument("--model-config-path", type=str, default="data/MobileLLM/config.json", help="Path to model config JSON.")
+    parser.add_argument("--model-weights-path", type=str, default="data/MobileLLM/model.safetensors", help="Path to teacher model weights (.safetensors).")
+    parser.add_argument("--data-path", type=str, default="data/edu_fineweb10B", help="Path to training dataset.")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_full_model", help="Directory to save checkpoints.")
+    parser.add_argument("--from_checkpoint", type=str, required=True, help="Path to a checkpoint file to resume training from.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use: cuda or cpu.")
+
+    # Training Hyperparameters
+    parser.add_argument("--max-steps", type=int, default=20000, help="Total number of training steps.")
+    parser.add_argument("--batch-size", type=int, default=2, help="Batch size per device.")
+    parser.add_argument("--seq-length", type=int, default=512, help="Sequence length for training.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4, help="Number of gradient accumulation steps.")
+    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Initial learning rate.")
+    parser.add_argument("--min-learning-rate", type=float, default=1e-5, help="Minimum learning rate for cosine annealing.")
+    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay factor.")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping threshold.")
+
+    # Distillation Hyperparameters
+    parser.add_argument("--alpha", type=float, default=0.5, help="Weight for KL loss vs CE loss.")
+    parser.add_argument("--temperature", type=float, default=2.0, help="Temperature scaling for distillation.")
+    parser.add_argument("--loss-chunk-size", type=int, default=1024, help="Chunk size for KL computation. 0 disables chunking.")
+
+    # Performance & Mixed Precision
+    parser.add_argument("--use-amp", action="store_true", help="Enable Automatic Mixed Precision (AMP).")
+    parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], help="AMP data type (float16 or bfloat16).")
+
+    # Logging and Saving
+    parser.add_argument("--log-interval", type=int, default=10, help="Steps between logging.")
+    parser.add_argument("--save-interval", type=int, default=1000, help="Steps between saving checkpoints.")
+    parser.add_argument("--val-interval", type=int, default=250, help="Steps between validation runs.")
+    parser.add_argument("--val-batches", type=int, default=10, help="Number of batches to evaluate during validation.")
+
+    # Student Model Configuration
+    parser.add_argument("--factorization-rank", type=int, default=16, help="Low-rank factorization rank for approximated layers.")
+    parser.add_argument("--layer-sharing", action="store_true", help="Enable weight sharing across student layers.")
 
     args = parser.parse_args()
     train_config = TrainingConfig(**vars(args))
