@@ -84,8 +84,12 @@ class CPCircuitLayer(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_size = hidden_states.size()
+        device = hidden_states.device
         num_modes = hidden_states.dim() - 1
         assert num_modes == 2, "This implementation only supports 2 modes (sequence and hidden)"
+        
+        # Ensure indices are on the same device as hidden_states
+        all_indices = all_indices.to(device)
 
         embedding_weights = [
             self.seq_mode_factor(hidden_states),
@@ -225,10 +229,11 @@ class LlamaModel(LlamaPreTrainedModel):
         hidden_states = inputs_embeds
 
         _, seq_len, hidden_size = hidden_states.size()
+        device = hidden_states.device
 
         grid_y, grid_x = torch.meshgrid(
-            torch.arange(seq_len, dtype=torch.long),
-            torch.arange(hidden_size, dtype=torch.long),
+            torch.arange(seq_len, dtype=torch.long, device=device),
+            torch.arange(hidden_size, dtype=torch.long, device=device),
             indexing="ij"
         )
         all_indices = torch.stack([grid_y, grid_x], dim=-1).view(-1, 2)
