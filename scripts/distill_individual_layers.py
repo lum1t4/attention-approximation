@@ -317,12 +317,12 @@ def train(state):
     """The main training loop."""
     if DDP_ENABLED:
         dist.init_process_group(backend='nccl')
-        LOGGER.info(f"DDP enabled. Rank: {RANK}, World Size: {WORLD_SIZE}")
+        print0(f"DDP enabled. Rank: {RANK}, World Size: {WORLD_SIZE}")
         state.device = torch.device(f"cuda:{LOCAL_RANK}")
         torch.cuda.set_device(state.device)
     else:
         state.device = device_parse(state.config.device)
-        LOGGER.info(f"Using device: {state.device}")
+        print0(f"Using device: {state.device}")
 
     state.model, state.student_params = setup_model(state)
     # Initialize components
@@ -367,9 +367,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_config_path", type=str, default="data/MobileLLM/config.json", help="Path to the LLaMA model config JSON file.")
     parser.add_argument("--model_weights_path", type=str, default="data/MobileLLM/model.safetensors", help="Path to the pretrained model weights (safetensors).")
     parser.add_argument("--data_path", type=str, default="data/edu_fineweb10B", help="Path to the training/validation dataset shards.")
-    parser.add_argument("--validation_split", type=str, default="test", help="Dataset split to use for validation.")
+    parser.add_argument("--val", type=str, default="test", help="Dataset split to use for validation.")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints.")
-    parser.add_argument("--device", type=str, default="mps", help="Device to train on (cuda, cpu, mps).")
+    parser.add_argument("--device", type=str, default="cpu", help="Device to train on (cuda, cpu, mps).")
 
     # Training Hyperparameters
     parser.add_argument("--max_steps", type=int, default=10000, help="Total number of training steps.")
@@ -396,3 +396,8 @@ if __name__ == "__main__":
     train_config = TrainingConfig(**vars(args))
     state = TrainContext(train_config)
     train(state)
+
+
+""""
+python scripts/distill_individual_layers.py --model_config_path 'data/MobileLLM/config.json' --model_weights_path 'data/MobileLLM/model.safetensors' --data_path 'data/minipile' --checkpoint_dir 'checkpoints' --device 'cuda' --max_steps 10000 --batch_size 2 --seq_length 128 --gradient_accumulation_steps 4 --learning_rate 1e-3 --min_learning_rate 1e-5 --weight_decay 1e-5 --warmup_steps 100 --grad_clip 1.0 --log_interval 10 --save_interval 1000 --val_interval 250 --val_batches 10 --factorization_rank 16 --layer_sharing
+"""
