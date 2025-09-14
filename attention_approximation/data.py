@@ -19,7 +19,6 @@ class DistributedDataLoader:
         self.rank = max(RANK, 0)
         self.num_processes = WORLD_SIZE
         self.current_shard = None
-        assert split in {'train', 'val'}
 
         # get the shard filenames
         shards = sorted((s for s in path.glob("shard_*") if split in s.name), key=lambda x: x.name)
