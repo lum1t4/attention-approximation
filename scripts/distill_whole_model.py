@@ -127,7 +127,7 @@ def setup_models(state: TrainContext):
 
     ckpt = torch.load(state.config.from_checkpoint, map_location="cpu")['model_state_dict']
     def rename_key(key):
-        key = key.replace("model.", "")
+        # Only rename the student_att part, keep model. prefix intact
         key = key.replace(".self_attn.student_att.", ".self_attn.")
         return key
 
