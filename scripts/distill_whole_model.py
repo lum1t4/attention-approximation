@@ -27,7 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import safetensors
 from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherModel
-from attention_approximation.modeling_llama_approximated import LlamaForCausalLM as StudentModel
+from attention_approximation.modeling_llama_approximated import LlamaModel as StudentModel
 from attention_approximation.pytorch import (
     device_parse,
     intersect_dicts,
