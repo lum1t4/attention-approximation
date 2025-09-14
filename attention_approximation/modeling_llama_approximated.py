@@ -1,8 +1,5 @@
-from einops import rearrange
 from .modeling_llama import LlamaMLP, LlamaRMSNorm
 from torch import nn
-from cirkit.symbolic.initializers import ConstantTensorInitializer
-from cirkit.pipeline import PipelineContext
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.activations import ACT2FN
@@ -93,26 +90,26 @@ class CPCircuitLayer(nn.Module):
             self.seq_mode_factor(hidden_states),
             self.hidden_mode_factor(hidden_states.transpose(1, 2).contiguous())
         ]
-    
+
         outputs = []
         for start in range(0, all_indices.size(0), self.chunk_size):
             end = start + self.chunk_size
-            chunk = all_indices[start:end]                   
-            chunk = chunk.unsqueeze(0).expand(batch, -1, -1)     
+            chunk = all_indices[start:end]
+            chunk = chunk.unsqueeze(0).expand(batch, -1, -1)
             emb_list = []
             for mode_idx in range(num_modes):
-                indices = chunk[:, :, mode_idx]              
-                w = embedding_weights[mode_idx]            
+                indices = chunk[:, :, mode_idx]
+                w = embedding_weights[mode_idx]
                 idx_expanded = indices.unsqueeze(-1).expand(-1, -1, self.rank)
                 emb = torch.gather(w, dim=1, index=idx_expanded)
                 emb_list.append(emb)
-    
+
             stacked = torch.stack(emb_list, dim=0)
             hadamard = torch.prod(stacked, dim=0)
-    
+
             out_chunk = self.cp(hadamard)
             outputs.append(out_chunk)
-    
+
         out = torch.cat(outputs, dim=1)
         return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
 
