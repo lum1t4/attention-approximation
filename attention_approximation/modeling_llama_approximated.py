@@ -76,7 +76,7 @@ class CPCircuitLayer(nn.Module):
         self.out_units = 1
         self.chunk_size = chunk_size
 
-        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias),
+        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias)
         self.hidden_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias)
 
         self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
