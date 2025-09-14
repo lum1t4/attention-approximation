@@ -295,7 +295,7 @@ def train(state):
         batch = state.train_loader.next_batch()
         distillation_loss = training_step(state, batch, step)
         running_loss += distillation_loss
-        if LOCAL_RANK in {-1, 0} and step % state.config.log_interval == 0:
+        if LOCAL_RANK in {-1, 0} and (step + 1) % state.config.log_interval == 0:
             avg_loss = running_loss / state.config.log_interval
             elapsed = time.time() - start_time
             tokens_per_sec = (state.config.batch_size * state.config.seq_length * state.config.log_interval * WORLD_SIZE) / elapsed
@@ -303,11 +303,11 @@ def train(state):
             running_loss = 0
             start_time = time.time()
 
-        if step % state.config.val_interval == 0:
+        if (step + 1) % state.config.val_interval == 0:
             val_loss = validate(state)
             print0(f"Validation Distill Loss: {val_loss:.4f}")
 
-        if step % state.config.save_interval == 0:
+        if (step + 1) % state.config.save_interval == 0:
             save_checkpoint(state, step + 1)
 
     print0("Training completed!")
@@ -355,5 +355,25 @@ if __name__ == "__main__":
 
 
 """"
-python scripts/distill_individual_layers.py --model_config_path 'data/MobileLLM/config.json' --model_weights_path 'data/MobileLLM/model.safetensors' --data_path 'data/minipile' --checkpoint_dir 'checkpoints' --device 'cuda' --max_steps 10000 --batch_size 2 --seq_length 128 --gradient_accumulation_steps 4 --learning_rate 1e-3 --min_learning_rate 1e-5 --weight_decay 1e-5 --warmup_steps 100 --grad_clip 1.0 --log_interval 10 --save_interval 1000 --val_interval 250 --val_batches 10 --factorization_rank 16 --layer_sharing
+python scripts/distill_individual_layers.py \
+    --model_config_path 'data/MobileLLM/config.json' \
+    --model_weights_path 'data/MobileLLM/model.safetensors' \
+    --data_path 'data/minipile' \
+    --checkpoint_dir 'checkpoints' \
+    --device 'cuda' \
+    --max_steps 1000 \
+    --batch_size 32 \
+    --seq_length 512 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 1e-3 \
+    --min_learning_rate 1e-5 \
+    --weight_decay 1e-5 \
+    --warmup_steps 100 \
+    --grad_clip 1.0 \
+    --log_interval 10 \
+    --save_interval 100 \
+    --val_interval 250 \
+    --val_batches 10 \
+    --factorization_rank 16 \
+    --layer_sharing
 """
