@@ -53,6 +53,7 @@ class TrainingConfig:
     model_weights_path: str = "data/MobileLLM/model.safetensors"
     data_path: str = "data/edu_fineweb10B"
     checkpoint_dir: str = "checkpoints_full_model"
+    val: str = "test"
     device: str = "cuda"  # or "cpu", user can override
 
     # Training Hyperparameters
@@ -173,7 +174,7 @@ def setup_dataloaders(state: TrainContext):
         path=Path(state.config.data_path),
         batch_size=state.config.batch_size,
         seq_len=state.config.seq_length,
-        split="val",
+        split=state.config.val,
     )
     return train_loader, val_loader
 
@@ -417,6 +418,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, default="data/edu_fineweb10B", help="Path to training dataset.")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_full_model", help="Directory to save checkpoints.")
     parser.add_argument("--from_checkpoint", type=str, required=True, help="Path to a checkpoint file to resume training from.")
+    parser.add_argument("--val", type=str, default="test", help="Dataset split to use for validation.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use: cuda or cpu.")
 
     # Training Hyperparameters
