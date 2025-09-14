@@ -80,7 +80,8 @@ class TrainingConfig:
     model_weights_path: str = "data/MobileLLM/model.safetensors"
     data_path: str = "data/edu_fineweb10B"
     checkpoint_dir: str = "checkpoints"
-    device: str = "mps"
+    val: str = "test"
+    device: str = "cuda"
     # Training Hyperparameters
     max_steps: int = 10000
     batch_size: int = 2
@@ -328,10 +329,7 @@ def train(state):
     state.optimizer = setup_optimizer(state)
     state.scheduler = setup_scheduler(state)
     state.train_loader, state.val_loader = setup_dataloaders(state)
-
-    if LOCAL_RANK in {-1, 0}:
-        LOGGER.info("Starting training...")
-
+    print0("Starting training...")
     state.optimizer.zero_grad()
 
     running_loss = 0
@@ -341,24 +339,19 @@ def train(state):
         batch = state.train_loader.next_batch()
         distillation_loss = training_step(state, batch, step)
         running_loss += distillation_loss
-        if LOCAL_RANK in {-1, 0} and (step + 1) % state.config.log_interval == 0:
+        if LOCAL_RANK in {-1, 0} and step % state.config.log_interval == 0:
             avg_loss = running_loss / state.config.log_interval
             elapsed = time.time() - start_time
             tokens_per_sec = (state.config.batch_size * state.config.seq_length * state.config.log_interval * WORLD_SIZE) / elapsed
-            print0(
-                f"Step {step+1}/{state.config.max_steps} | "
-                f"Distill Loss: {avg_loss:.4f} | "
-                f"LR: {state.scheduler.get_last_lr()[0]:.2e} | "
-                f"Tokens/s: {tokens_per_sec:.0f}"
-            )
+            print0(f"Step {step+1}/{state.config.max_steps} | Distill Loss: {avg_loss:.4f} | LR: {state.scheduler.get_last_lr()[0]:.2e} | Tokens/s: {tokens_per_sec:.0f}")
             running_loss = 0
             start_time = time.time()
 
-        if (step + 1) % state.config.val_interval == 0:
+        if step % state.config.val_interval == 0:
             val_loss = validate(state)
             print0(f"Validation Distill Loss: {val_loss:.4f}")
 
-        if (step + 1) % state.config.save_interval == 0:
+        if step % state.config.save_interval == 0:
             save_checkpoint(state, step + 1)
 
     print0("Training completed!")
@@ -370,54 +363,34 @@ def train(state):
 if __name__ == "__main__":
     """Parses command-line arguments, creates config and context, then starts training."""
     parser = argparse.ArgumentParser(description="Train replaced attention layers in a LLaMA model via distillation.")
-
     # Model and Data Paths
-    parser.add_argument("--model_config_path", type=str, default="data/MobileLLM/config.json",
-                        help="Path to the LLaMA model config JSON file.")
-    parser.add_argument("--model_weights_path", type=str, default="data/MobileLLM/model.safetensors",
-                        help="Path to the pretrained model weights (safetensors).")
-    parser.add_argument("--data_path", type=str, default="data/edu_fineweb10B",
-                        help="Path to the training/validation dataset shards.")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
-                        help="Directory to save checkpoints.")
-    parser.add_argument("--device", type=str, default="mps",
-                        help="Device to train on (cuda, cpu, mps).")
+    parser.add_argument("--model_config_path", type=str, default="data/MobileLLM/config.json", help="Path to the LLaMA model config JSON file.")
+    parser.add_argument("--model_weights_path", type=str, default="data/MobileLLM/model.safetensors", help="Path to the pretrained model weights (safetensors).")
+    parser.add_argument("--data_path", type=str, default="data/edu_fineweb10B", help="Path to the training/validation dataset shards.")
+    parser.add_argument("--validation_split", type=str, default="test", help="Dataset split to use for validation.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints.")
+    parser.add_argument("--device", type=str, default="mps", help="Device to train on (cuda, cpu, mps).")
 
     # Training Hyperparameters
-    parser.add_argument("--max_steps", type=int, default=10000,
-                        help="Total number of training steps.")
-    parser.add_argument("--batch_size", type=int, default=2,
-                        help="Batch size per process.")
-    parser.add_argument("--seq_length", type=int, default=128,
-                        help="Sequence length for training.")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
-                        help="Steps to accumulate gradients before optimizer step.")
-    parser.add_argument("--learning_rate", type=float, default=1e-3,
-                        help="Initial learning rate.")
-    parser.add_argument("--min_learning_rate", type=float, default=1e-5,
-                        help="Minimum learning rate for cosine annealing scheduler.")
-    parser.add_argument("--weight_decay", type=float, default=1e-5,
-                        help="Weight decay for optimizer.")
-    parser.add_argument("--warmup_steps", type=int, default=100,
-                        help="Number of warmup steps for scheduler.")
-    parser.add_argument("--grad_clip", type=float, default=1.0,
-                        help="Maximum gradient norm for clipping.")
+    parser.add_argument("--max_steps", type=int, default=10000, help="Total number of training steps.")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size per process.")
+    parser.add_argument("--seq_length", type=int, default=128, help="Sequence length for training.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Steps to accumulate gradients before optimizer step.")
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Initial learning rate.")
+    parser.add_argument("--min_learning_rate", type=float, default=1e-5, help="Minimum learning rate for cosine annealing scheduler.")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay for optimizer.")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps for scheduler.")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Maximum gradient norm for clipping.")
 
     # Logging and Saving
-    parser.add_argument("--log_interval", type=int, default=10,
-                        help="How often to log training metrics (in steps).")
-    parser.add_argument("--save_interval", type=int, default=1000,
-                        help="How often to save checkpoints (in steps).")
-    parser.add_argument("--val_interval", type=int, default=250,
-                        help="How often to run validation (in steps).")
-    parser.add_argument("--val_batches", type=int, default=10,
-                        help="Number of validation batches to average over.")
+    parser.add_argument("--log_interval", type=int, default=10, help="How often to log training metrics (in steps).")
+    parser.add_argument("--save_interval", type=int, default=1000, help="How often to save checkpoints (in steps).")
+    parser.add_argument("--val_interval", type=int, default=250, help="How often to run validation (in steps).")
+    parser.add_argument("--val_batches", type=int, default=10, help="Number of validation batches to average over.")
 
     # Student Model Configuration
-    parser.add_argument("--factorization_rank", type=int, default=16,
-                        help="Factorization rank for approximated attention.")
-    parser.add_argument("--layer_sharing", action="store_true",
-                        help="Enable layer sharing in student attention.")
+    parser.add_argument("--factorization_rank", type=int, default=16, help="Factorization rank for approximated attention.")
+    parser.add_argument("--layer_sharing", action="store_true", help="Enable layer sharing in student attention.")
 
     args = parser.parse_args()
     train_config = TrainingConfig(**vars(args))

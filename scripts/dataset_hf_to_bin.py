@@ -64,7 +64,7 @@ def main(
                 progress_bar.update(num_tokens)
             else:
                 # finish current shard
-                split = "val" if shard_index == 0 and reserve_val_shard else "train"
+                split = "val" if shard_index == 0 and reserve_val_shard else split
                 # split the document into whatever fits in this shard; the remainder goes to next one
                 remainder = shard_size - token_count
                 progress_bar.update(remainder)
@@ -79,7 +79,7 @@ def main(
 
     # write last incomplete shard
     if token_count > 0:
-        split = "val" if shard_index == 0 and reserve_val_shard else "train"
+        split = "val" if shard_index == 0 and reserve_val_shard else split
         np.save(output_dir / f"shard_{split}_{shard_index:06d}", shard[:token_count])
 
 
