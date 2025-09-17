@@ -5,7 +5,8 @@ using L2 loss to distill the attention outputs from the original attention layer
 
 import time
 import argparse
-from copy import copy
+import itertools
+from copy import copy, deepcopy
 from pathlib import Path
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -201,7 +202,7 @@ def patch_model(state, model: nn.Module) -> tuple[nn.Module, list[nn.Parameter]]
     all_indices = torch.stack([grid_y, grid_x], dim=-1).view(-1, 2)
     student_config.all_indices = all_indices.to(state.device)
 
-    model.requires_grad_(False)  # Freeze the entire model initially
+    model.requires_grad_(False)
     for i, layer in enumerate(model.model.layers):
         layer.self_attn = AttentionDistillationWrapper(
             student_att=LlamaApproximatedAttention,
@@ -397,6 +398,37 @@ def train(state):
         dist.destroy_process_group()
 
 
+def run_grid_search(base_config: TrainingConfig, batch_sizes: list[int], factorization_ranks: list[int], grid_max_steps: int = 1000):
+    best_loss = float("inf")
+    best_config = None
+    results = []
+
+    for bs, rank in itertools.product(batch_sizes, factorization_ranks):
+        trial_config = deepcopy(base_config)
+        trial_config.batch_size = bs
+        trial_config.factorization_rank = rank
+        trial_config.max_steps = grid_max_steps
+
+        print0(f"\n=== Running trial with batch_size={bs}, factorization_rank={rank} ===")
+        state = TrainContext(trial_config)
+        
+        train(state)
+        val_loss = validate(state)
+        results.append(((bs, rank), val_loss))
+        print0(f"Trial finished | Val Loss={val_loss:.4f}")
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_config = deepcopy(trial_config)
+
+    print0("\n=== Grid Search Completed ===")
+    for (bs, rank), loss in results:
+        print0(f"batch_size={bs}, factorization_rank={rank} | Val Loss={loss:.4f}")
+    print0(f"\nBest config: batch_size={best_config.batch_size}, factorization_rank={best_config.factorization_rank} | Val Loss={best_loss:.4f}")
+
+    return best_config, best_loss, results
+
+
 
 if __name__ == "__main__":
     """Parses command-line arguments, creates config and context, then starts training."""
@@ -429,9 +461,15 @@ if __name__ == "__main__":
     # Student Model Configuration
     parser.add_argument("--factorization_rank", type=int, default=16, help="Factorization rank for approximated attention.")
     parser.add_argument("--layer_sharing", action="store_true", help="Enable layer sharing in student attention.")
+    parser.add_argument("--grid_search", action="store_true", help="Run grid search instead of a single training run.")
 
     args = parser.parse_args()
     train_config = TrainingConfig(**vars(args))
-    state = TrainContext(train_config)
-    train(state)
 
+    if args.grid_search:
+        batch_sizes = [32, 64]
+        factorization_ranks = [32, 64, 128]
+        run_grid_search(train_config, batch_sizes, factorization_ranks, grid_max_steps=500)
+    else:
+        state = TrainContext(train_config)
+        train(state)
