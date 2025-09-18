@@ -1,0 +1,39 @@
+params:
+  val: "test"
+  seed: 1337
+  dtype: "bfloat16"  # float16 or bfloat16
+  # Training Hyperparameters
+  max_steps: 20000
+  batch_size: 16
+  seq_length: 512  # Increased default to show value of chunking
+  grad_accum_steps: 4
+  lr: 1e-4
+  min_lr: 1e-5
+  weight_decay: 1e-5
+  grad_clip: 1.0
+  device: "cuda"
+
+  # Distillation Hyperparameters
+  alpha: 0.5
+  temperature: 2.0
+  loss_chunk_size: 1024  # Chunk size for memory-efficient loss. 0 to disable.
+
+  # Performance & Mixed Precision
+  use_amp: true
+  amp_dtype: "bfloat16"  # float16 or bfloat16
+
+  # Logging and Saving
+  log_interval: 10
+  save_interval: 1000
+  val_interval: 250
+  val_batches: 10
+
+  # Student Model Configuration
+  factorization_rank: 16
+  layer_sharing: false
+
+  # Model and Data Paths
+  model_config_path: "data/MobileLLM/config.json"
+  model_weights_path: "data/MobileLLM/model.safetensors"
+  data_path: "data/minipile"
+  from_checkpoint: "checkpoints/checkpoint_last.pt"
