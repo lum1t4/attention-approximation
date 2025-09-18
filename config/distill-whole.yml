@@ -3,7 +3,7 @@ params:
   seed: 1337
   dtype: "bfloat16"  # float16 or bfloat16
   # Training Hyperparameters
-  max_steps: 2000
+  max_steps: 2000 # 500M tokens with 4GPUs, B = 32, S = 512 and grad_accum = 4
   batch_size: 32
   seq_length: 512  # Increased default to show value of chunking
   grad_accum_steps: 4

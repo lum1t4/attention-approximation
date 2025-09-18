@@ -141,6 +141,7 @@ class TrainingConfig:
     # Student Model Configuration
     factorization_rank: int = 16
     layer_sharing: bool = False
+    grid_search: bool = False
 
 
 @rank_zero_only
@@ -342,13 +343,19 @@ def save_checkpoint(state, step):
     model = de_parallel(state.model) if DDP_ENABLED else state.model
     ckpt = Path(state.config.checkpoint_dir)
     ckpt.mkdir(exist_ok=True)
-    ckpt = ckpt / f"checkpoint_step_{step}.pt"
+    import io
+    buffer = io.BytesIO()
+
+    
     torch.save({
         'step': step,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': state.optimizer.state_dict(),
         'scheduler_state_dict': state.scheduler.state_dict(),
-    }, ckpt)
+    }, buffer)
+    (ckpt / f"checkpoint_last.pt").write_bytes(buffer.getvalue())
+    ckpt = ckpt / f"checkpoint_step_{step}.pt"
+    (ckpt).write_bytes(buffer.getvalue())
     LOGGER.info(f"Saved checkpoint to {ckpt}")
 
 
@@ -398,18 +405,17 @@ def train(state):
         dist.destroy_process_group()
 
 
-def run_grid_search(base_config: TrainingConfig, batch_sizes: list[int], factorization_ranks: list[int], grid_max_steps: int = 1000):
+def run_grid_search(base_config: TrainingConfig, factorization_ranks: list[int], grid_max_steps: int = 1000):
     best_loss = float("inf")
     best_config = None
     results = []
 
-    for bs, rank in itertools.product(batch_sizes, factorization_ranks):
+    for rank in factorization_ranks:
         trial_config = deepcopy(base_config)
-        trial_config.batch_size = bs
         trial_config.factorization_rank = rank
         trial_config.max_steps = grid_max_steps
 
-        print0(f"\n=== Running trial with batch_size={bs}, factorization_rank={rank} ===")
+        print0(f"\n=== Running trial with factorization_rank={rank} ===")
         state = TrainContext(trial_config)
         
         train(state)
@@ -467,9 +473,8 @@ if __name__ == "__main__":
     train_config = TrainingConfig(**vars(args))
 
     if args.grid_search:
-        batch_sizes = [32, 64]
         factorization_ranks = [32, 64, 128]
-        run_grid_search(train_config, batch_sizes, factorization_ranks, grid_max_steps=500)
+        run_grid_search(train_config, factorization_ranks, grid_max_steps=500)
     else:
         state = TrainContext(train_config)
         train(state)

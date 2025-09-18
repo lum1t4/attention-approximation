@@ -285,7 +285,7 @@ def save_checkpoint(state, step):
             "model_state_dict": de_parallel(state.model).state_dict(),
             "optimizer_state_dict": state.optimizer.state_dict(),
             "scheduler_state_dict": state.scheduler.state_dict(),
-            "config": state.config,
+            "config": vars(state.config),
         },
         ckpt_path,
     )
