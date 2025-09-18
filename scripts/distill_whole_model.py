@@ -2,44 +2,40 @@
 """
 This script trains a student LLaMA model with approximated attention layers
 by distilling knowledge from a larger, frozen teacher model.
-
-It incorporates several advanced features:
-1.  Automatic Mixed Precision (AMP) for faster training and reduced memory usage.
-2.  Memory-efficient loss chunking to handle long sequences.
-3.  Robust checkpointing and resuming for long training runs.
-
 The distillation is performed using a combination of KL Divergence and Cross-Entropy loss.
 """
 
-import time
 import argparse
+import time
 from copy import copy
-from pathlib import Path
 from dataclasses import dataclass, fields
-
-import torch
-import torch.optim as optim
-import torch.distributed as dist
-import torch.nn.functional as F
-from torch import nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.nn.parallel import DistributedDataParallel as DDP
+from pathlib import Path
 
 import safetensors
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import torch.optim as optim
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from attention_approximation.data import DistributedDataLoader
 from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherModel
 from attention_approximation.modeling_llama_approximated import LlamaForCausalLM as StudentModel
 from attention_approximation.pytorch import (
-    device_parse,
-    intersect_dicts,
-    WORLD_SIZE,
     LOCAL_RANK,
     RANK,
-    rank_zero_only,
+    WORLD_SIZE,
     de_parallel,
+    device_parse,
+    device_memory_clear,
+    device_memory_used,
+    init_seeds,
+    intersect_dicts,
+    rank_zero_only,
 )
-from attention_approximation.utils import LOGGER
-from distill_individual_layers import DistributedDataLoader
-
+from attention_approximation.utils import LOGGER, yaml_load
 
 DDP_ENABLED = WORLD_SIZE > 1
 
@@ -55,14 +51,16 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints_full_model"
     val: str = "test"
     device: str = "cuda"  # or "cpu", user can override
+    dtype: str = "bfloat16"  # float16 or bfloat16
+    seed: int = 0
 
     # Training Hyperparameters
     max_steps: int = 20000
     batch_size: int = 2
     seq_length: int = 512  # Increased default to show value of chunking
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-5
+    grad_accum_steps: int = 4
+    lr: float = 1e-4
+    min_lr: float = 1e-5
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
 
@@ -84,6 +82,9 @@ class TrainingConfig:
     # Student Model Configuration
     factorization_rank: int = 16
     layer_sharing: bool = False
+
+# Enable TF32 for faster matmuls on Ampere+ GPUs
+torch.set_float32_matmul_precision('high')
 
 
 @rank_zero_only
@@ -108,84 +109,46 @@ class TrainContext:
 
 
 def setup_models(state: TrainContext):
-    # (No changes from previous version)
-    teacher_config = TeacherModel.config_class.from_json_file(state.config.model_config_path)
-    teacher_model = TeacherModel(teacher_config)
+    """Loads teacher and student models"""
+    config = TeacherModel.config_class.from_json_file(state.config.model_config_path)
+    teacher = TeacherModel(config)
     ckpt = safetensors.torch.load_file(state.config.model_weights_path)
-    csd = intersect_dicts(ckpt, teacher_model.state_dict())
-    teacher_model.load_state_dict(csd, strict=False)
-    teacher_model.to(state.device)
-    teacher_model.requires_grad_(False)
-    teacher_model.eval()
-    print0(f"Transferred {len(csd)}/{len(teacher_model.state_dict())} items from pretrained weights")
+    csd = intersect_dicts(ckpt, teacher.state_dict())
+    teacher.load_state_dict(csd, strict=False)
+    teacher = torch.compile(teacher.to(state.device)).eval()
+    print0(f"Transferred {len(csd)}/{len(teacher.state_dict())} items from pretrained weights")
 
-    student_config = copy(teacher_config)
-    student_config.factorization_rank = state.config.factorization_rank
-    student_config.layer_sharing = state.config.layer_sharing
-    student_config.seq_length = state.config.seq_length
-    student_model = StudentModel(student_config)
+    config.factorization_rank = state.config.factorization_rank
+    config.layer_sharing = state.config.layer_sharing
+    config.seq_length = state.config.seq_length
+    model = StudentModel(config)
 
     ckpt = torch.load(state.config.from_checkpoint, map_location="cpu")['model_state_dict']
-    def rename_key(key):
-        # Only rename the student_att part, keep model. prefix intact
-        key = key.replace(".self_attn.student_att.", ".self_attn.")
-        return key
+    # Only rename the student_att part, keep model. prefix intact
+    ckpt = {k.replace(".self_attn.student_att.", ".self_attn."): v for k, v in ckpt.items()}
+    csd = intersect_dicts(ckpt, model.state_dict())
+    csd = intersect_dicts(ckpt, model.state_dict())
+    model.load_state_dict(csd, strict=False)
+    model = torch.compile(model.to(state.device))
+    LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
 
-    ckpt = {rename_key(k) : v for k, v in ckpt.items()}
-    csd = intersect_dicts(ckpt, student_model.state_dict())
-    student_model.load_state_dict(csd, strict=False)
-    student_model.to(state.device)
-    student_model.train()
-    LOGGER.info(f"Transferred {len(csd)}/{len(student_model.state_dict())} items from pretrained weights")
-
-    if DDP_ENABLED:
-        dist.barrier()
-        student_model = DDP(student_model, device_ids=[LOCAL_RANK])
-
-    return teacher_model, student_model
-
-
-def setup_optimizer(state: TrainContext):
-    # (No changes from previous version)
-    model_to_optimize = de_parallel(state.student_model)
-    return optim.AdamW(
-        model_to_optimize.parameters(),
-        lr=state.config.learning_rate,
-        weight_decay=state.config.weight_decay,
-    )
-
-
-def setup_scheduler(state: TrainContext):
-    # (No changes from previous version)
-    return CosineAnnealingLR(
-        state.optimizer, T_max=state.config.max_steps, eta_min=state.config.min_learning_rate
-    )
+    if DDP_ENABLED: dist.barrier()
+    return teacher, model
 
 
 def setup_dataloaders(state: TrainContext):
-    # (No changes from previous version)
-    train_loader = DistributedDataLoader(
-        path=Path(state.config.data_path),
-        batch_size=state.config.batch_size,
-        seq_len=state.config.seq_length,
-        split="train",
-    )
-    val_loader = DistributedDataLoader(
-        path=Path(state.config.data_path),
-        batch_size=state.config.batch_size,
-        seq_len=state.config.seq_length,
-        split=state.config.val,
-    )
-    return train_loader, val_loader
-
+    state.train_loader = DistributedDataLoader(path=Path(state.config.data_path), batch_size=state.config.batch_size, seq_len=state.config.seq_length, split="train")
+    state.val_loader = DistributedDataLoader(path=Path(state.config.data_path), batch_size=state.config.batch_size, seq_len=state.config.seq_length, split=state.config.val)
+    return state
 
 def calculate_loss(
-    state: TrainContext,
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     targets: torch.Tensor,
+    alpha: float = 0.5,
+    temperature: float = 2.0,
 ):
-    """Calculates combined loss, with optional memory-efficient chunking for KL term."""
+    """Calculates combined loss"""
     # Cross-Entropy Loss
     loss_ce = F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), targets.view(-1))
 
@@ -193,97 +156,89 @@ def calculate_loss(
     student_logits_flat = student_logits.view(-1, student_logits.size(-1))
     teacher_logits_flat = teacher_logits.view(-1, teacher_logits.size(-1))
 
-    T = state.config.temperature
-
-    # Check if chunking is enabled and necessary
-    if (
-        state.config.loss_chunk_size > 0
-        and student_logits_flat.size(0) > state.config.loss_chunk_size
-    ):
-        # Memory-efficient chunked computation
-        kl_loss = torch.tensor(0.0, device=state.device, dtype=student_logits.dtype)
-        num_tokens = student_logits_flat.size(0)
-
-        for i in range(0, num_tokens, state.config.loss_chunk_size):
-            end = i + state.config.loss_chunk_size
-            student_chunk = student_logits_flat[i:end]
-            teacher_chunk = teacher_logits_flat[i:end]
-
-            student_log_probs = F.log_softmax(student_chunk / T, dim=-1)
-            teacher_log_probs = F.log_softmax(teacher_chunk / T, dim=-1)
-
-            # Use log_target=True for efficiency, reduction='sum' to aggregate over chunks
-            chunk_kl = F.kl_div(
-                student_log_probs, teacher_log_probs, reduction="sum", log_target=True
-            )
-            kl_loss += chunk_kl
-
-        # Average the loss over all tokens
-        kl_loss /= num_tokens
-
-    else:
-        # Direct computation for smaller tensors
-        student_log_probs = F.log_softmax(student_logits_flat / T, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_logits_flat / T, dim=-1)
-        kl_loss = F.kl_div(
-            student_log_probs, teacher_log_probs, reduction="batchmean", log_target=True
-        )
-
-    loss_kl = kl_loss * (T**2)
-    alpha = state.config.alpha
-    combined_loss = alpha * loss_kl + (1.0 - alpha) * loss_ce
-
-    return combined_loss, loss_ce.item(), loss_kl.item()
+    student_log_probs = F.log_softmax(student_logits_flat / temperature, dim=-1)
+    teacher_log_probs = F.log_softmax(teacher_logits_flat / temperature, dim=-1)
+    kl_loss = F.kl_div(student_log_probs, teacher_log_probs, reduction="batchmean", log_target=True)
+    loss_kl = kl_loss * (temperature**2)
+    return alpha * loss_kl + (1.0 - alpha) * loss_ce, loss_ce, loss_kl
 
 
-def training_step(state: TrainContext, batch, step: int):
+def training_step(state: TrainContext, step: int):
     """Performs a single training step, including forward and backward passes with AMP."""
-    x, y = batch
-    x, y = x.to(state.device), y.to(state.device)
+    state.model.train()
 
-    # Forward pass with AMP
-    with torch.autocast(
-        device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp
-    ):
-        with torch.inference_mode():
-            teacher_logits = state.teacher_model(x).logits
-        student_logits = state.student_model(x).logits
-        loss, loss_ce, loss_kl = calculate_loss(state, student_logits, teacher_logits, y)
+    t0 = time.time()
+    state.optimizer.zero_grad()
+    alpha = state.config.alpha
+    temperature = state.config.temperature
 
-    scaled_loss = loss / state.config.gradient_accumulation_steps
+    device, use_amp, dtype = state.device, state.config.use_amp, state.dtype
+    cum_loss = 0.0
+    cum_ce_loss = 0.0
+    cum_kl_loss = 0.0
 
-    # Backward pass with GradScaler
-    if state.scaler:
-        state.scaler.scale(scaled_loss).backward()
-    else:
-        scaled_loss.backward()
+    for k in range(state.config.grad_accum_steps):
+        x, y = state.train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        if DDP_ENABLED:
+            # Avoid unnecessary gradient syncs
+            state.model.require_backward_grad_sync = (k == state.config.grad_accum_steps - 1)
 
-    if (step + 1) % state.config.gradient_accumulation_steps == 0:
-        model_to_clip = de_parallel(state.student_model)
+        # Forward pass with AMP
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=use_amp):
+            with torch.inference_mode():
+                teacher_logits = state.teacher(x).logits
+            logits = state.model(x).logits
+            loss, loss_ce, loss_kl = calculate_loss(logits, teacher_logits, y, alpha, temperature)
+            loss = loss / state.config.grad_accum_steps
+            cum_loss += loss.detach()
+            cum_ce_loss += loss_ce.detach() / state.config.grad_accum_steps
+            cum_kl_loss += loss_kl.detach() / state.config.grad_accum_steps
+            # Backward pass
+            state.scaler.scale(loss).backward()
 
-        # Unscale gradients before clipping
-        if state.scaler:
-            state.scaler.unscale_(state.optimizer)
+    if DDP_ENABLED:
+        dist.all_reduce(cum_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(cum_ce_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(cum_kl_loss, op=dist.ReduceOp.AVG)
 
-        torch.nn.utils.clip_grad_norm_(model_to_clip.parameters(), state.config.grad_clip)
+    cum_loss = cum_loss.item()
 
-        # Optimizer step with GradScaler
-        if state.scaler:
-            state.scaler.step(state.optimizer)
-            state.scaler.update()
-        else:
-            state.optimizer.step()
 
-        state.scheduler.step()
-        state.optimizer.zero_grad()
+    # Optimization step
+    # unscale gradients
+    state.scaler.unscale_(state.optimizer)
+    # clip gradients, optimizer step
+    norm = torch.nn.utils.clip_grad_norm_(state.model.parameters(), max_norm=10.0)
+    state.scaler.step(state.optimizer)
+    state.scaler.update()
+    state.optimizer.zero_grad()
 
-    return loss.item(), loss_ce, loss_kl
+    # Logging
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+    dt = time.time() - t0
+    lr = state.scheduler.get_last_lr()[0]
+    tokens_per_second = state.config.grad_accum_steps * WORLD_SIZE * state.config.batch_size * state.config.seq_length / dt
+    print0(
+        f"step {step+1:4d}/{state.config.max_steps} "
+        f"| train loss {cum_loss:.6f} | ce loss {cum_ce_loss:.6f} "
+        f"| kl loss {cum_kl_loss:.6f} | norm {norm:.4f} | lr {lr:.2e} "
+        f"| ({(dt)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+        f"| Mem {device_memory_used(device):.2f} GB"
+    )
+    return state
 
 
 @torch.inference_mode()
-def validate(state: TrainContext):
+def validation_step(state: TrainContext, step: int):
     """Runs the validation loop with AMP."""
-    state.student_model.eval()
+    if (step + 1) % state.config.val_interval != 0:
+        return state
+    state.model.eval()
     total_loss, total_ce, total_kl = 0.0, 0.0, 0.0
 
     for _ in range(state.config.val_batches):
@@ -292,15 +247,15 @@ def validate(state: TrainContext):
 
         # Forward pass with AMP context for validation
         with torch.autocast(device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp):
-            teacher_logits = state.teacher_model(x).logits
-            student_logits = state.student_model(x).logits
+            teacher_logits = state.teacher(x).logits
+            student_logits = state.model(x).logits
             loss, loss_ce, loss_kl = calculate_loss(state, student_logits, teacher_logits, y)
 
         total_loss += loss.item()
         total_ce += loss_ce
         total_kl += loss_kl
 
-    state.student_model.train()
+    state.model.train()
 
     if DDP_ENABLED:
         total_losses_tensor = torch.tensor([total_loss, total_ce, total_kl], device=state.device)
@@ -311,25 +266,25 @@ def validate(state: TrainContext):
     avg_ce = total_ce / (state.config.val_batches * WORLD_SIZE)
     avg_kl = total_kl / (state.config.val_batches * WORLD_SIZE)
 
-    return avg_loss, avg_ce, avg_kl
+    return state
 
 
 @rank_zero_only
 def save_checkpoint(state, step):
     """Saves a robust checkpoint for resuming training."""
-    model_to_save = de_parallel(state.student_model)
+    if step % state.config.save_interval != 0:
+        return
     ckpt_dir = Path(state.config.checkpoint_dir)
     ckpt_dir.mkdir(exist_ok=True)
-    ckpt_path = ckpt_dir / f"checkpoint_step_{step}.pt"
+    ckpt_path = ckpt_dir / f"whole_{step}.pt"
 
     # Save all necessary states for a full resume
     torch.save(
         {
             "step": step,
-            "model_state_dict": model_to_save.state_dict(),
+            "model_state_dict": de_parallel(state.model).state_dict(),
             "optimizer_state_dict": state.optimizer.state_dict(),
             "scheduler_state_dict": state.scheduler.state_dict(),
-            "scaler_state_dict": state.scaler.state_dict() if state.scaler else None,
             "config": state.config,
         },
         ckpt_path,
@@ -347,62 +302,34 @@ def train(state: TrainContext):
     else:
         state.device = device_parse(state.config.device)
 
+
     # Setup AMP dtype and GradScaler
-    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
-    state.dtype = dtype_map.get(state.config.amp_dtype, torch.float32)
-    use_cuda_for_amp = state.device.type == "cuda" and state.config.use_amp
-    state.scaler = torch.amp.GradScaler(enabled=use_cuda_for_amp and state.dtype == torch.float16)
-    print0(f"Using device: {state.device}, AMP enabled: {state.config.use_amp}, DType: {state.dtype}")
+    config = state.config
+    init_seeds(config.seed)
 
-    state.teacher_model, state.student_model = setup_models(state)
-    state.optimizer = setup_optimizer(state)
-    state.scheduler = setup_scheduler(state)
-    state.train_loader, state.val_loader = setup_dataloaders(state)
 
+    dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[config.dtype]
+    use_amp = config.use_amp and state.device.type not in {"cpu", "mps"}
+    state.amp = use_amp
+    state.dtype = dtype
+    state.scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    state.teacher, state.model = setup_models(state)
+
+    if DDP_ENABLED:
+        state.model = DDP(state.model, device_ids=[LOCAL_RANK])
+    state.optimizer = optim.AdamW(state.model.parameters(), lr=state.config.lr, weight_decay=state.config.weight_decay)
+    state.scheduler = CosineAnnealingLR(state.optimizer, T_max=state.config.max_steps, eta_min=state.config.min_lr)
+    setup_dataloaders(state)
 
     print0("Starting training...")
     state.optimizer.zero_grad()
 
-    running_loss, running_ce, running_kl = 0.0, 0.0, 0.0
-    start_time = time.time()
-
     # Loop starts from `start_step`
     for step in range(state.config.max_steps):
-        batch = state.train_loader.next_batch()
-        loss, loss_ce, loss_kl = training_step(state, batch, step)
-        running_loss += loss
-        running_ce += loss_ce
-        running_kl += loss_kl
-
-        if (step + 1) % state.config.log_interval == 0:
-            if LOCAL_RANK in {-1, 0}:
-                # The logic here remains the same, just reporting the results
-                # of the more efficient training step.
-                avg_loss = running_loss / state.config.log_interval
-                avg_ce = running_ce / state.config.log_interval
-                avg_kl = running_kl / state.config.log_interval
-                elapsed = time.time() - start_time
-                tokens_per_sec = (
-                    state.config.batch_size
-                    * state.config.seq_length
-                    * state.config.log_interval
-                    * WORLD_SIZE
-                ) / elapsed
-                print0(
-                    f"Step {step + 1}/{state.config.max_steps} | "
-                    f"Loss: {avg_loss:.4f} (CE: {avg_ce:.4f}, KL: {avg_kl:.4f}) | "
-                    f"LR: {state.scheduler.get_last_lr()[0]:.2e} | "
-                    f"Tokens/s: {tokens_per_sec:.0f}"
-                )
-                running_loss, running_ce, running_kl = 0.0, 0.0, 0.0
-                start_time = time.time()
-
-        if (step + 1) % state.config.val_interval == 0:
-            val_loss, val_ce, val_kl = validate(state)
-            print0(f"Validation Loss: {val_loss:.4f} (CE: {val_ce:.4f}, KL: {val_kl:.4f})")
-
-        if (step + 1) % state.config.save_interval == 0:
-            save_checkpoint(state, step + 1)
+        training_step(state, step)
+        validation_step(state, step)
+        save_checkpoint(state, step + 1)
 
     print0("Training completed!")
     if DDP_ENABLED:
@@ -413,44 +340,55 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a student LLaMA model via full model distillation with advanced features.")
 
     # Model and Data Paths
-    parser.add_argument("--model-config-path", type=str, default="data/MobileLLM/config.json", help="Path to model config JSON.")
-    parser.add_argument("--model-weights-path", type=str, default="data/MobileLLM/model.safetensors", help="Path to teacher model weights (.safetensors).")
-    parser.add_argument("--data-path", type=str, default="data/edu_fineweb10B", help="Path to training dataset.")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_full_model", help="Directory to save checkpoints.")
-    parser.add_argument("--from_checkpoint", type=str, required=True, help="Path to a checkpoint file to resume training from.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
+    parser.add_argument("--config", type=str, default="config/distill-whole.yml", help="Path to YAML config file.")
+    parser.add_argument("--model_config_path", type=str, default="data/MobileLLM/config.json", help="Path to model config JSON.")
+    parser.add_argument("--model_weights_path", type=str, default="data/MobileLLM/model.safetensors", help="Path to teacher model weights (.safetensors).")
+    parser.add_argument("--data_path", type=str, default="data/minipile", help="Path to training dataset.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_full_model", help="Directory to save checkpoints.")
+    parser.add_argument("--from_checkpoint", type=str, default="checkpoints/checkpoint_last.pt", help="Path to a checkpoint file to resume training from.")
     parser.add_argument("--val", type=str, default="test", help="Dataset split to use for validation.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use: cuda or cpu.")
+    parser.add_argument("--device", type=str, default="cpu", help="Device to use: cuda or cpu.")
 
     # Training Hyperparameters
-    parser.add_argument("--max-steps", type=int, default=20000, help="Total number of training steps.")
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size per device.")
-    parser.add_argument("--seq-length", type=int, default=512, help="Sequence length for training.")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4, help="Number of gradient accumulation steps.")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Initial learning rate.")
-    parser.add_argument("--min-learning-rate", type=float, default=1e-5, help="Minimum learning rate for cosine annealing.")
-    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay factor.")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping threshold.")
+    parser.add_argument("--max_steps", type=int, default=20000, help="Total number of training steps.")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size per device.")
+    parser.add_argument("--seq_length", type=int, default=512, help="Sequence length for training.")
+    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Number of gradient accumulation steps.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate.")
+    parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate for cosine annealing.")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay factor.")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping threshold.")
 
     # Distillation Hyperparameters
     parser.add_argument("--alpha", type=float, default=0.5, help="Weight for KL loss vs CE loss.")
     parser.add_argument("--temperature", type=float, default=2.0, help="Temperature scaling for distillation.")
-    parser.add_argument("--loss-chunk-size", type=int, default=1024, help="Chunk size for KL computation. 0 disables chunking.")
-
     # Performance & Mixed Precision
-    parser.add_argument("--use-amp", action="store_true", help="Enable Automatic Mixed Precision (AMP).")
-    parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], help="AMP data type (float16 or bfloat16).")
+    parser.add_argument("--use_amp", action="store_true", help="Enable Automatic Mixed Precision (AMP).")
+    parser.add_argument("--amp_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], help="AMP data type (float16 or bfloat16).")
 
     # Logging and Saving
-    parser.add_argument("--log-interval", type=int, default=10, help="Steps between logging.")
-    parser.add_argument("--save-interval", type=int, default=1000, help="Steps between saving checkpoints.")
-    parser.add_argument("--val-interval", type=int, default=250, help="Steps between validation runs.")
-    parser.add_argument("--val-batches", type=int, default=10, help="Number of batches to evaluate during validation.")
+    parser.add_argument("--log_interval", type=int, default=10, help="Steps between logging.")
+    parser.add_argument("--save_interval", type=int, default=1000, help="Steps between saving checkpoints.")
+    parser.add_argument("--val_interval", type=int, default=250, help="Steps between validation runs.")
+    parser.add_argument("--val_batches", type=int, default=10, help="Number of batches to evaluate during validation.")
 
     # Student Model Configuration
-    parser.add_argument("--factorization-rank", type=int, default=16, help="Low-rank factorization rank for approximated layers.")
-    parser.add_argument("--layer-sharing", action="store_true", help="Enable weight sharing across student layers.")
-
+    parser.add_argument("--factorization_rank", type=int, default=16, help="Low-rank factorization rank for approximated layers.")
+    parser.add_argument("--layer_sharing", action="store_true", help="Enable weight sharing across student layers.")
     args = parser.parse_args()
-    train_config = TrainingConfig(**vars(args))
+
+    args = vars(args)
+    if args["config"]:
+        args = yaml_load(args.pop("config"))['params']
+        # args = {**base, **args}  # Command-line args override config file
+    train_config = TrainingConfig(**args)
     state = TrainContext(train_config)
     train(state)
+
+
+
+# salloc -A IscrC_LAM-next -p boost_usr_prod --qos=boost_qos_lprod --gres=gpu:1 --mem=0 --time=10:00:00
+# srun --pty bash
+# python scripts/train.py --config "config/distill-whole.yml"
+# torchrun --standalone --nproc_per_node=4 scripts/train.py --config "config/distill-whole.yml"

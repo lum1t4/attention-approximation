@@ -37,3 +37,6 @@ ignore = ["E501"]
 [tool.black]
 line-length = 88
 target-version = ["py310"]
+
+[tool.uv]
+no-build-isolation-package = ['flash-attn', 'setuptools']

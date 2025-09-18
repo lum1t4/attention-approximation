@@ -3,20 +3,19 @@ params:
   seed: 1337
   dtype: "bfloat16"  # float16 or bfloat16
   # Training Hyperparameters
-  max_steps: 20000
-  batch_size: 16
+  max_steps: 2000
+  batch_size: 32
   seq_length: 512  # Increased default to show value of chunking
   grad_accum_steps: 4
-  lr: 1e-4
-  min_lr: 1e-5
-  weight_decay: 1e-5
-  grad_clip: 1.0
+  lr: 0.0001
+  min_lr: 0.00001
+  weight_decay: 0.00001
+  grad_clip: 10.0
   device: "cuda"
 
   # Distillation Hyperparameters
   alpha: 0.5
   temperature: 2.0
-  loss_chunk_size: 1024  # Chunk size for memory-efficient loss. 0 to disable.
 
   # Performance & Mixed Precision
   use_amp: true
@@ -24,7 +23,7 @@ params:
 
   # Logging and Saving
   log_interval: 10
-  save_interval: 1000
+  save_interval: 5
   val_interval: 250
   val_batches: 10
 
