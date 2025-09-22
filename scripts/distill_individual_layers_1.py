@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 import torch
 import torch.optim as optim
+import torch.nn.init as init
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 # Removed DDP import
@@ -29,7 +30,6 @@ class CP(nn.Module):
     def forward(self, hadamard: torch.Tensor) -> torch.Tensor:
         return hadamard @ self.weight.t()
 
-
 class CPCircuitLayer(nn.Module):
     def __init__(self, config: LlamaConfig, chunk_size: int = 1_000):
         super().__init__()
@@ -37,8 +37,15 @@ class CPCircuitLayer(nn.Module):
         self.rank = config.factorization_rank
         self.chunk_size = chunk_size
 
-        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias)
-        self.hidden_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias)
+        self.seq_mode_factor = nn.Linear(
+            config.hidden_size, config.factorization_rank, bias=config.attention_bias
+        )
+        # shape: [hidden_size, rank]
+        self.hidden_embeddings = nn.Parameter(
+            torch.empty(config.hidden_size, config.factorization_rank)
+            )
+        #initilaize with a small Gaussian like Transformers embeddings
+        init.normal_(self.hidden_embeddings, mean=0.0, std=0.02)
 
         self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
 
@@ -46,49 +53,36 @@ class CPCircuitLayer(nn.Module):
         batch, seq_len, hidden_size = hidden_states.size()
         device = hidden_states.device
 
-        # Convert indices to device if needed
+        # Move indices to correct device
         all_indices = all_indices.to(device)
 
-        # Compute embeddings for each mode
-        # seq_mode: [batch, seq_len, rank]
+        # seq_embeddings: [batch, seq_len, rank]
         seq_embeddings = self.seq_mode_factor(hidden_states)
-
-        # For hidden mode, we need to transpose and apply the linear layer
-        # hidden_states: [batch, seq_len, hidden_size] -> [batch, hidden_size, seq_len]
-        hidden_transposed = hidden_states.transpose(1, 2)
-        # hidden_mode: [batch, hidden_size, rank]
-        hidden_embeddings = self.hidden_mode_factor(hidden_transposed)
 
         outputs = []
         for start in range(0, all_indices.size(0), self.chunk_size):
             end = min(start + self.chunk_size, all_indices.size(0))
             chunk = all_indices[start:end]  # [chunk_size, 2]
 
-            # Get indices for each mode
             seq_indices = chunk[:, 0].long()  # [chunk_size]
             hidden_indices = chunk[:, 1].long()  # [chunk_size]
 
-            # Expand for batch dimension
-            seq_indices = seq_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
-            hidden_indices = hidden_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
+            # Gather sequence embeddings for batch
+            seq_emb = seq_embeddings[:, seq_indices]  # [batch, chunk_size, rank]
 
-            # Index into embeddings
-            # seq_embeddings: [batch, seq_len, rank]
-            seq_indices_expanded = seq_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
-            seq_emb = torch.gather(seq_embeddings, dim=1, index=seq_indices_expanded)  # [batch, chunk_size, rank]
+            # Gather hidden embeddings (shared across batch)
+            hidden_emb = self.hidden_embeddings[hidden_indices]  # [chunk_size, rank]
+            hidden_emb = hidden_emb.unsqueeze(0).expand(batch, -1, -1)  # [batch, chunk_size, rank]
 
-            # hidden_embeddings: [batch, hidden_size, rank]
-            hidden_indices_expanded = hidden_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
-            hidden_emb = torch.gather(hidden_embeddings, dim=1, index=hidden_indices_expanded)  # [batch, chunk_size, rank]
-
-            # Compute hadamard product
+            # Hadamard product
             hadamard = seq_emb * hidden_emb  # [batch, chunk_size, rank]
 
-            # Apply CP decomposition
+            # CP projection
             out_chunk = self.cp(hadamard)  # [batch, chunk_size, out_units]
             outputs.append(out_chunk)
 
         out = torch.cat(outputs, dim=1)  # [batch, total_size, out_units]
+
         return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
 
 
