@@ -390,5 +390,5 @@ if __name__ == "__main__":
 
 # salloc -A IscrC_LAM-next -p boost_usr_prod --qos=boost_qos_lprod --gres=gpu:1 --mem=0 --time=10:00:00
 # srun --pty bash
-# python scripts/train.py --config "config/distill-whole.yml"
-# torchrun --standalone --nproc_per_node=4 scripts/train.py --config "config/distill-whole.yml"
+# python scripts/distill_whole_model.py --config "config/distill-whole.yml"
+# torchrun --standalone --nproc_per_node=4 scripts/distill_whole_model.py --config "config/distill-whole.yml"

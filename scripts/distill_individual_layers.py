@@ -1,11 +1,6 @@
-"""
-This script is used to train replaced attention layers in a LLaMA model
-using L2 loss to distill the attention outputs from the original attention layers.
-"""
-
+import gc
 import time
 import argparse
-import itertools
 from copy import copy, deepcopy
 from pathlib import Path
 from dataclasses import dataclass
@@ -13,19 +8,28 @@ from collections.abc import Callable
 
 import torch
 import torch.optim as optim
-import torch.distributed as dist
+import torch.nn.init as init
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
+# Removed DDP import
 from transformers import LlamaConfig
 import safetensors
 from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherModel
-from attention_approximation.pytorch import device_parse, intersect_dicts, WORLD_SIZE, LOCAL_RANK, RANK, rank_zero_only, de_parallel
-from attention_approximation.utils import LOGGER
+from attention_approximation.pytorch import (
+    device_parse,
+    intersect_dicts,
+    WORLD_SIZE,
+    LOCAL_RANK,
+    RANK,
+    rank_zero_only,
+    de_parallel,
+    LOCAL_RANK,
+    device_memory_clear,
+    device_memory_used,
+    init_seeds,
+)
+from attention_approximation.utils import LOGGER, yaml_load
 from attention_approximation.data import DistributedDataLoader
-
-
-DDP_ENABLED = WORLD_SIZE > 1
 
 
 class CP(nn.Module):
@@ -38,7 +42,6 @@ class CP(nn.Module):
     def forward(self, hadamard: torch.Tensor) -> torch.Tensor:
         return hadamard @ self.weight.t()
 
-
 class CPCircuitLayer(nn.Module):
     def __init__(self, config: LlamaConfig, chunk_size: int = 1_000):
         super().__init__()
@@ -46,8 +49,15 @@ class CPCircuitLayer(nn.Module):
         self.rank = config.factorization_rank
         self.chunk_size = chunk_size
 
-        self.seq_mode_factor = nn.Linear(config.hidden_size, config.factorization_rank, bias=config.attention_bias)
-        self.hidden_mode_factor = nn.Linear(config.seq_length, config.factorization_rank, bias=config.attention_bias)
+        self.seq_mode_factor = nn.Linear(
+            config.hidden_size, config.factorization_rank, bias=config.attention_bias
+        )
+        # shape: [hidden_size, rank]
+        self.hidden_embeddings = nn.Parameter(
+            torch.empty(config.hidden_size, config.factorization_rank)
+            )
+        #initilaize with a small Gaussian like Transformers embeddings
+        init.normal_(self.hidden_embeddings, mean=0.0, std=0.02)
 
         self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
 
@@ -55,50 +65,38 @@ class CPCircuitLayer(nn.Module):
         batch, seq_len, hidden_size = hidden_states.size()
         device = hidden_states.device
 
-        # Convert indices to device if needed
+        # Move indices to correct device
         all_indices = all_indices.to(device)
 
-        # Compute embeddings for each mode
-        # seq_mode: [batch, seq_len, rank]
+        # seq_embeddings: [batch, seq_len, rank]
         seq_embeddings = self.seq_mode_factor(hidden_states)
-
-        # For hidden mode, we need to transpose and apply the linear layer
-        # hidden_states: [batch, seq_len, hidden_size] -> [batch, hidden_size, seq_len]
-        hidden_transposed = hidden_states.transpose(1, 2)
-        # hidden_mode: [batch, hidden_size, rank]
-        hidden_embeddings = self.hidden_mode_factor(hidden_transposed)
 
         outputs = []
         for start in range(0, all_indices.size(0), self.chunk_size):
             end = min(start + self.chunk_size, all_indices.size(0))
             chunk = all_indices[start:end]  # [chunk_size, 2]
 
-            # Get indices for each mode
             seq_indices = chunk[:, 0].long()  # [chunk_size]
             hidden_indices = chunk[:, 1].long()  # [chunk_size]
 
-            # Expand for batch dimension
-            seq_indices = seq_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
-            hidden_indices = hidden_indices.unsqueeze(0).expand(batch, -1)  # [batch, chunk_size]
+            # Gather sequence embeddings for batch
+            seq_emb = seq_embeddings[:, seq_indices]  # [batch, chunk_size, rank]
 
-            # Index into embeddings
-            # seq_embeddings: [batch, seq_len, rank]
-            seq_indices_expanded = seq_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
-            seq_emb = torch.gather(seq_embeddings, dim=1, index=seq_indices_expanded)  # [batch, chunk_size, rank]
+            # Gather hidden embeddings (shared across batch)
+            hidden_emb = self.hidden_embeddings[hidden_indices]  # [chunk_size, rank]
+            hidden_emb = hidden_emb.unsqueeze(0).expand(batch, -1, -1)  # [batch, chunk_size, rank]
 
-            # hidden_embeddings: [batch, hidden_size, rank]
-            hidden_indices_expanded = hidden_indices.unsqueeze(-1).expand(-1, -1, self.rank)  # [batch, chunk_size, rank]
-            hidden_emb = torch.gather(hidden_embeddings, dim=1, index=hidden_indices_expanded)  # [batch, chunk_size, rank]
-
-            # Compute hadamard product
+            # Hadamard product
             hadamard = seq_emb * hidden_emb  # [batch, chunk_size, rank]
 
-            # Apply CP decomposition
+            # CP projection
             out_chunk = self.cp(hadamard)  # [batch, chunk_size, out_units]
             outputs.append(out_chunk)
 
         out = torch.cat(outputs, dim=1)  # [batch, total_size, out_units]
+
         return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
+
 
 class LlamaApproximatedAttention(nn.Module):
     def __init__(self, config: LlamaConfig, all_indices: torch.Tensor):
@@ -123,6 +121,7 @@ class TrainingConfig:
     device: str = "cuda"
     # Training Hyperparameters
     max_steps: int = 10000
+    seed: int = 42
     batch_size: int = 2
     seq_length: int = 128
     gradient_accumulation_steps: int = 4
@@ -143,10 +142,16 @@ class TrainingConfig:
     layer_sharing: bool = False
     grid_search: bool = False
 
+    # DataParallel option
+    use_dataparallel: bool = False
+
 
 @rank_zero_only
 def print0(s:str):
     LOGGER.info(s)
+
+# Enable TF32 for faster matmuls on Ampere+ GPUs
+torch.set_float32_matmul_precision('high')
 
 class AttentionDistillationWrapper(nn.Module):
     """
@@ -214,6 +219,7 @@ def patch_model(state, model: nn.Module) -> tuple[nn.Module, list[nn.Parameter]]
             LOGGER.info(f"Replaced attention in layer {i}")
 
     model = model.to(state.device)
+    # model = torch.compile(model)
 
     student_params = []
     for layer in model.model.layers:
@@ -232,15 +238,11 @@ def setup_model(state):
     csd = intersect_dicts(checkpoint, model.state_dict())
     model.load_state_dict(csd, strict=False)
     print0(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
-    # Ensure all processes have the same initial weights if in DDP mode
-    if DDP_ENABLED:
-        dist.barrier()
+
     model.eval() # Teacher parts of the model should be in eval mode
     model, student_params = patch_model(state, model)
-    if DDP_ENABLED:
-        # DDP requires find_unused_parameters=True because the final model output
-        # does not depend on the student parameters, only the distillation loss does.
-        model = DDP(model, device_ids=[LOCAL_RANK], find_unused_parameters=True)
+
+    # Do not wrap here with DDP or DataParallel; wrapping is done by caller (train)
     return model, student_params
 
 
@@ -277,10 +279,10 @@ def training_step(state: TrainContext, batch, step: int):
     x, y = batch
     x, y = x.to(state.device), y.to(state.device)
 
-    # Forward pass is performed through the DDP-wrapped model
+    # Forward pass is performed through the possibly-wrapped model
     state.model(x)
 
-    # The model to access layers is state.model.module in DDP
+    # The model to access layers is de_parallel(state.model)
     model = de_parallel(state.model)
     # Collect attention distillation losses from all layers
     total_att_loss = 0
@@ -328,25 +330,18 @@ def validate(state: TrainContext) -> float:
         if num_att_layers > 0:
             total_loss += (step_loss / num_att_layers)
 
-    # Aggregate losses across all DDP processes
-    if DDP_ENABLED:
-        total_loss_tensor = torch.tensor(total_loss, device=state.device)
-        dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
-        total_loss = total_loss_tensor.item()
-
-    return total_loss / (state.config.val_batches * WORLD_SIZE)
+    return (total_loss / state.config.val_batches).item()
 
 
 @rank_zero_only
 def save_checkpoint(state, step):
     """Saves a training checkpoint, only on the master process."""
-    model = de_parallel(state.model) if DDP_ENABLED else state.model
+    model = de_parallel(state.model)
     ckpt = Path(state.config.checkpoint_dir)
     ckpt.mkdir(exist_ok=True)
     import io
     buffer = io.BytesIO()
 
-    
     torch.save({
         'step': step,
         'model_state_dict': model.state_dict(),
@@ -361,16 +356,21 @@ def save_checkpoint(state, step):
 
 def train(state):
     """The main training loop."""
-    if DDP_ENABLED:
-        dist.init_process_group(backend='nccl')
-        print0(f"DDP enabled. Rank: {RANK}, World Size: {WORLD_SIZE}")
-        state.device = torch.device(f"cuda:{LOCAL_RANK}")
-        torch.cuda.set_device(state.device)
+    # DataParallel runs in single process; we must ensure device is set and model will be moved to cuda:0
+    use_dp = state.config.use_dataparallel and torch.cuda.is_available() and torch.cuda.device_count() > 1
+    if use_dp:
+        state.device = torch.device("cuda:0")
+        torch.cuda.set_device(0)
+        print0(f"DataParallel enabled. Found {torch.cuda.device_count()} GPUs. Using device: {state.device}")
     else:
         state.device = device_parse(state.config.device)
         print0(f"Using device: {state.device}")
 
     state.model, state.student_params = setup_model(state)
+
+    if use_dp:
+        state.model = nn.DataParallel(state.model)
+
     # Initialize components
     state.optimizer = setup_optimizer(state)
     state.scheduler = setup_scheduler(state)
@@ -381,6 +381,8 @@ def train(state):
     running_loss = 0
     start_time = time.time()
 
+    effective_world_size = torch.cuda.device_count() if use_dp else 1
+
     for step in range(state.config.max_steps):
         batch = state.train_loader.next_batch()
         distillation_loss = training_step(state, batch, step)
@@ -388,8 +390,16 @@ def train(state):
         if LOCAL_RANK in {-1, 0} and (step + 1) % state.config.log_interval == 0:
             avg_loss = running_loss / state.config.log_interval
             elapsed = time.time() - start_time
-            tokens_per_sec = (state.config.batch_size * state.config.seq_length * state.config.log_interval * WORLD_SIZE) / elapsed
-            print0(f"Step {step+1}/{state.config.max_steps} | Distill Loss: {avg_loss:.4f} | LR: {state.scheduler.get_last_lr()[0]:.2e} | Tokens/s: {tokens_per_sec:.0f}")
+            tokens_per_sec = (state.config.batch_size * state.config.seq_length * state.config.log_interval * effective_world_size) / elapsed
+            print0(
+                f"Step {step+1}/{state.config.max_steps} | "
+                f"Distill Loss: {avg_loss:.4f}  | "
+                f"LR: {state.scheduler.get_last_lr()[0]:.2e} | "
+                f"Tokens/s: {tokens_per_sec:.0f} | "
+                f"Mem {device_memory_used(state.device):.2f} GB | "
+                f"BS {state.config.batch_size}x{effective_world_size}"
+            )
+
             running_loss = 0
             start_time = time.time()
 
@@ -401,8 +411,46 @@ def train(state):
             save_checkpoint(state, step + 1)
 
     print0("Training completed!")
-    if DDP_ENABLED:
-        dist.destroy_process_group()
+
+def cleanup_state(state):
+    try:
+        base_model = de_parallel(state.model)
+    except Exception:
+        base_model = getattr(state, "model", None)
+
+    if base_model is not None:
+        try:
+            base_model.to("cpu")
+        except Exception:
+            pass
+
+    for attr in ("model", "student_params", "optimizer", "scheduler", "train_loader", "val_loader"):
+        if hasattr(state, attr):
+            try:
+                delattr(state, attr)
+            except Exception:
+                try:
+                    setattr(state, attr, None)
+                except Exception:
+                    pass
+
+    try:
+        del base_model
+    except Exception:
+        pass
+
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
 
 
 def run_grid_search(base_config: TrainingConfig, factorization_ranks: list[int], grid_max_steps: int = 1000):
@@ -417,29 +465,32 @@ def run_grid_search(base_config: TrainingConfig, factorization_ranks: list[int],
 
         print0(f"\n=== Running trial with factorization_rank={rank} ===")
         state = TrainContext(trial_config)
-        
+
         train(state)
         val_loss = validate(state)
-        results.append(((bs, rank), val_loss))
+        results.append((rank, val_loss))
         print0(f"Trial finished | Val Loss={val_loss:.4f}")
+
+        cleanup_state(state)
 
         if val_loss < best_loss:
             best_loss = val_loss
             best_config = deepcopy(trial_config)
 
     print0("\n=== Grid Search Completed ===")
-    for (bs, rank), loss in results:
-        print0(f"batch_size={bs}, factorization_rank={rank} | Val Loss={loss:.4f}")
-    print0(f"\nBest config: batch_size={best_config.batch_size}, factorization_rank={best_config.factorization_rank} | Val Loss={best_loss:.4f}")
+    for rank, loss in results:
+        print0(f"factorization_rank={rank} | Val Loss={loss:.4f}")
+    print0(f"\nBest config: factorization_rank={best_config.factorization_rank} | Val Loss={best_loss:.4f}")
 
     return best_config, best_loss, results
-
 
 
 if __name__ == "__main__":
     """Parses command-line arguments, creates config and context, then starts training."""
     parser = argparse.ArgumentParser(description="Train replaced attention layers in a LLaMA model via distillation.")
     # Model and Data Paths
+    parser.add_argument("--config", type=str, default="config/distll-layers.yml", help="Path to YAML config file.")
+
     parser.add_argument("--model_config_path", type=str, default="data/MobileLLM/config.json", help="Path to the LLaMA model config JSON file.")
     parser.add_argument("--model_weights_path", type=str, default="data/MobileLLM/model.safetensors", help="Path to the pretrained model weights (safetensors).")
     parser.add_argument("--data_path", type=str, default="data/edu_fineweb10B", help="Path to the training/validation dataset shards.")
@@ -469,12 +520,24 @@ if __name__ == "__main__":
     parser.add_argument("--layer_sharing", action="store_true", help="Enable layer sharing in student attention.")
     parser.add_argument("--grid_search", action="store_true", help="Run grid search instead of a single training run.")
 
-    args = parser.parse_args()
-    train_config = TrainingConfig(**vars(args))
+    # DataParallel flag
+    parser.add_argument("--use_dataparallel", action="store_true", help="Wrap model with torch.nn.DataParallel (single-process multi-GPU).")
 
-    if args.grid_search:
+    args = parser.parse_args()
+    args = vars(args)
+    if args["config"]:
+        args = yaml_load(args.pop("config"))['params']
+        # args = {**base, **args}  # Command-line args override config file
+    train_config = TrainingConfig(**args)
+
+    if train_config.grid_search:
         factorization_ranks = [32, 64, 128]
         run_grid_search(train_config, factorization_ranks, grid_max_steps=500)
     else:
         state = TrainContext(train_config)
         train(state)
+
+# salloc -A IscrC_LAM-next -p boost_usr_prod --qos=boost_qos_lprod --gres=gpu:1 --mem=0 --time=10:00:00
+# srun --pty bash
+# python scripts/distill_individual_layers.py --config "config/distll-layers.yml"
+# torchrun --standalone --nproc_per_node=4 scripts/distill_individual_layers.py --config "config/distll-layers.yml"

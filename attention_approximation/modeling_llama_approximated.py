@@ -5,7 +5,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 from torch.nn import CrossEntropyLoss
-
+import torch.nn.init as init
 import torch
 import torch.nn.functional as F
 
@@ -72,52 +72,60 @@ class CP(nn.Module):
 
 
 class CPCircuitLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, chunk_size: int = 1000):
+    def __init__(self, config: LlamaConfig, chunk_size: int = 1_000):
         super().__init__()
         self.out_units = 1
-        self.chunk_size = chunk_size
         self.rank = config.factorization_rank
+        self.chunk_size = chunk_size
 
-        self.seq_mode_factor = nn.Linear(config.hidden_size, self.rank, bias=config.attention_bias)
-        self.hidden_mode_factor = nn.Linear(config.seq_length, self.rank, bias=config.attention_bias)
+        self.seq_mode_factor = nn.Linear(
+            config.hidden_size, config.factorization_rank, bias=config.attention_bias
+        )
+        # shape: [hidden_size, rank]
+        self.hidden_embeddings = nn.Parameter(
+            torch.empty(config.hidden_size, config.factorization_rank)
+            )
+        #initilaize with a small Gaussian like Transformers embeddings
+        init.normal_(self.hidden_embeddings, mean=0.0, std=0.02)
 
-        self.cp = CP(rank=self.rank, out_units=self.out_units)
+        self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
 
     def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_size = hidden_states.size()
         device = hidden_states.device
-        num_modes = hidden_states.dim() - 1
-        assert num_modes == 2, "This implementation only supports 2 modes (sequence and hidden)"
-        
-        # Ensure indices are on the same device as hidden_states
+
+        # Move indices to correct device
         all_indices = all_indices.to(device)
 
-        embedding_weights = [
-            self.seq_mode_factor(hidden_states),
-            self.hidden_mode_factor(hidden_states.transpose(1, 2).contiguous())
-        ]
+        # seq_embeddings: [batch, seq_len, rank]
+        seq_embeddings = self.seq_mode_factor(hidden_states)
 
         outputs = []
         for start in range(0, all_indices.size(0), self.chunk_size):
-            end = start + self.chunk_size
-            chunk = all_indices[start:end]
-            chunk = chunk.unsqueeze(0).expand(batch, -1, -1)
-            emb_list = []
-            for mode_idx in range(num_modes):
-                indices = chunk[:, :, mode_idx]
-                w = embedding_weights[mode_idx]
-                idx_expanded = indices.unsqueeze(-1).expand(-1, -1, self.rank)
-                emb = torch.gather(w, dim=1, index=idx_expanded)
-                emb_list.append(emb)
+            end = min(start + self.chunk_size, all_indices.size(0))
+            chunk = all_indices[start:end]  # [chunk_size, 2]
 
-            stacked = torch.stack(emb_list, dim=0)
-            hadamard = torch.prod(stacked, dim=0)
+            seq_indices = chunk[:, 0].long()  # [chunk_size]
+            hidden_indices = chunk[:, 1].long()  # [chunk_size]
 
-            out_chunk = self.cp(hadamard)
+            # Gather sequence embeddings for batch
+            seq_emb = seq_embeddings[:, seq_indices]  # [batch, chunk_size, rank]
+
+            # Gather hidden embeddings (shared across batch)
+            hidden_emb = self.hidden_embeddings[hidden_indices]  # [chunk_size, rank]
+            hidden_emb = hidden_emb.unsqueeze(0).expand(batch, -1, -1)  # [batch, chunk_size, rank]
+
+            # Hadamard product
+            hadamard = seq_emb * hidden_emb  # [batch, chunk_size, rank]
+
+            # CP projection
+            out_chunk = self.cp(hadamard)  # [batch, chunk_size, out_units]
             outputs.append(out_chunk)
 
-        out = torch.cat(outputs, dim=1)
+        out = torch.cat(outputs, dim=1)  # [batch, total_size, out_units]
+
         return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
+
 
 class LlamaApproximatedAttention(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
