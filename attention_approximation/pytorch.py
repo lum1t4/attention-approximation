@@ -219,6 +219,16 @@ def device_memory_clear(device: torch.device):
         torch.cuda.empty_cache()
 
 
+def device_synchronize(device: torch.device):
+    """Synchronize accelerator."""
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+    else:
+        return
+
+
 def check_amp(device: torch.device) -> bool:
     import re
     prefix = colorstr("AMP: ")

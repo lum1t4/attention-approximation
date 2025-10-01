@@ -1,10 +1,10 @@
 params:
   val: "test"
   seed: 1337
-  dtype: "bfloat16"  # float16 or bfloat16
+
   # Training Hyperparameters
-  max_steps: 2000 # 500M tokens with 4GPUs, B = 32, S = 512 and grad_accum = 4
-  batch_size: 32
+  max_steps: 2000000 # 500M tokens with 4GPUs, B = 32, S = 512 and grad_accum = 4
+  batch_size: 18
   seq_length: 512  # Increased default to show value of chunking
   grad_accum_steps: 4
   lr: 0.0001
@@ -18,17 +18,16 @@ params:
   temperature: 2.0
 
   # Performance & Mixed Precision
-  use_amp: true
-  amp_dtype: "bfloat16"  # float16 or bfloat16
+  amp: true
+  dtype: "bfloat16"  # float16 or bfloat16
 
   # Logging and Saving
-  log_interval: 10
   save_interval: 5
   val_interval: 250
   val_batches: 10
 
   # Student Model Configuration
-  factorization_rank: 16
+  factorization_rank: 128
   layer_sharing: false
 
   # Model and Data Paths
@@ -36,3 +35,6 @@ params:
   model_weights_path: "data/MobileLLM/model.safetensors"
   data_path: "data/minipile"
   from_checkpoint: "checkpoints/checkpoint_last.pt"
+
+  tracker: "wandb"
+  project: "attention-approximation"

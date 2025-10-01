@@ -31,11 +31,14 @@ from attention_approximation.pytorch import (
     device_parse,
     device_memory_clear,
     device_memory_used,
+    device_synchronize,
     init_seeds,
     intersect_dicts,
     rank_zero_only,
 )
 from attention_approximation.utils import LOGGER, yaml_load
+from attention_approximation.trackers import Tracker, AutoTracker
+import gc
 
 DDP_ENABLED = WORLD_SIZE > 1
 
@@ -43,7 +46,7 @@ DDP_ENABLED = WORLD_SIZE > 1
 @dataclass
 class TrainingConfig:
     """Stores all hyperparameters and configuration settings."""
-    from_checkpoint: str
+    from_checkpoint: str = "checkpoints/checkpoint_last.pt"
     # Model and Data Paths
     model_config_path: str = "data/MobileLLM/config.json"
     model_weights_path: str = "data/MobileLLM/model.safetensors"
@@ -51,7 +54,7 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints_full_model"
     val: str = "test"
     device: str = "cuda"  # or "cpu", user can override
-    dtype: str = "bfloat16"  # float16 or bfloat16
+    
     seed: int = 0
 
     # Training Hyperparameters
@@ -67,14 +70,12 @@ class TrainingConfig:
     # Distillation Hyperparameters
     alpha: float = 0.5
     temperature: float = 2.0
-    loss_chunk_size: int = 1024  # Chunk size for memory-efficient loss. 0 to disable.
 
     # Performance & Mixed Precision
-    use_amp: bool = False
-    amp_dtype: str = "bfloat16"  # float16 or bfloat16
+    dtype: str = "bfloat16"  # float16 or bfloat16
+    amp: bool = False
 
     # Logging and Saving
-    log_interval: int = 10
     save_interval: int = 1000
     val_interval: int = 250
     val_batches: int = 10
@@ -82,6 +83,9 @@ class TrainingConfig:
     # Student Model Configuration
     factorization_rank: int = 16
     layer_sharing: bool = False
+    tracker: str = None
+    project: str = "attention-approximation"
+    name: str = None
 
 # Enable TF32 for faster matmuls on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
@@ -106,6 +110,7 @@ class TrainContext:
 
     def __init__(self, config: TrainingConfig):
         self.config = config
+        self.tracker = AutoTracker(name=config.tracker, config=vars(config))
 
 
 def setup_models(state: TrainContext):
@@ -125,14 +130,21 @@ def setup_models(state: TrainContext):
 
     ckpt = torch.load(state.config.from_checkpoint, map_location="cpu")['model_state_dict']
     # Only rename the student_att part, keep model. prefix intact
-    ckpt = {k.replace(".self_attn.student_att.", ".self_attn."): v for k, v in ckpt.items()}
+    def match_dict(state_dict):
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace('_orig_mod.', '')
+            if 'self_attn.teacher_att.' not in k:
+                new_key = new_key.replace(".self_attn.student_att.", ".self_attn.")
+                new_state_dict[new_key] = v
+        return new_state_dict
+
+    ckpt = match_dict(ckpt)
     csd = intersect_dicts(ckpt, model.state_dict())
-    csd = intersect_dicts(ckpt, model.state_dict())
+    assert len(csd) > 0, "No weights were transferred from the checkpoint. Please check the checkpoint path and model architecture."
     model.load_state_dict(csd, strict=False)
     model = torch.compile(model.to(state.device))
     LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
-
-    if DDP_ENABLED: dist.barrier()
     return teacher, model
 
 
@@ -172,7 +184,7 @@ def training_step(state: TrainContext, step: int):
     alpha = state.config.alpha
     temperature = state.config.temperature
 
-    device, use_amp, dtype = state.device, state.config.use_amp, state.dtype
+    device, amp, dtype = state.device, state.config.amp, state.dtype
     cum_loss = 0.0
     cum_ce_loss = 0.0
     cum_kl_loss = 0.0
@@ -185,7 +197,7 @@ def training_step(state: TrainContext, step: int):
             state.model.require_backward_grad_sync = (k == state.config.grad_accum_steps - 1)
 
         # Forward pass with AMP
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=use_amp):
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=amp):
             with torch.inference_mode():
                 teacher_logits = state.teacher(x).logits
             logits = state.model(x).logits
@@ -209,16 +221,14 @@ def training_step(state: TrainContext, step: int):
     # unscale gradients
     state.scaler.unscale_(state.optimizer)
     # clip gradients, optimizer step
-    norm = torch.nn.utils.clip_grad_norm_(state.model.parameters(), max_norm=10.0)
+    norm = torch.nn.utils.clip_grad_norm_(state.model.parameters(), max_norm=state.config.grad_clip)
     state.scaler.step(state.optimizer)
     state.scaler.update()
     state.optimizer.zero_grad()
+    state.scheduler.step()
 
     # Logging
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elif device.type == "mps":
-        torch.mps.synchronize()
+    device_synchronize(device)
 
     dt = time.time() - t0
     lr = state.scheduler.get_last_lr()[0]
@@ -230,6 +240,18 @@ def training_step(state: TrainContext, step: int):
         f"| ({(dt)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
         f"| Mem {device_memory_used(device):.2f} GB"
     )
+
+    state.tracker.log({
+        "train/loss": cum_loss,
+        "train/ce_loss": cum_ce_loss,
+        "train/kl_loss": cum_kl_loss,
+        "train/lr": lr,
+        "train/norm": norm,
+        "train/tokens_per_second": tokens_per_second,
+        "train/mem": device_memory_used(device),
+    }, step=step)
+    gc.collect()
+    device_memory_clear(state.device)
     return state
 
 
@@ -240,22 +262,22 @@ def validation_step(state: TrainContext, step: int):
         return state
     state.model.eval()
     total_loss, total_ce, total_kl = 0.0, 0.0, 0.0
-
+    alpha = state.config.alpha
+    temperature = state.config.temperature
+    
     for _ in range(state.config.val_batches):
         x, y = state.val_loader.next_batch()
         x, y = x.to(state.device), y.to(state.device)
 
         # Forward pass with AMP context for validation
-        with torch.autocast(device_type=state.device.type, dtype=state.dtype, enabled=state.config.use_amp):
+        with torch.autocast(device_type=state.device.type, dtype=state.dtype, enabled=state.config.amp):
             teacher_logits = state.teacher(x).logits
-            student_logits = state.model(x).logits
-            loss, loss_ce, loss_kl = calculate_loss(state, student_logits, teacher_logits, y)
+            logits = state.model(x).logits
+            loss, loss_ce, loss_kl = calculate_loss(logits, teacher_logits, y, alpha, temperature)
 
         total_loss += loss.item()
-        total_ce += loss_ce
-        total_kl += loss_kl
-
-    state.model.train()
+        total_ce += loss_ce.item()
+        total_kl += loss_kl.item()
 
     if DDP_ENABLED:
         total_losses_tensor = torch.tensor([total_loss, total_ce, total_kl], device=state.device)
@@ -265,6 +287,12 @@ def validation_step(state: TrainContext, step: int):
     avg_loss = total_loss / (state.config.val_batches * WORLD_SIZE)
     avg_ce = total_ce / (state.config.val_batches * WORLD_SIZE)
     avg_kl = total_kl / (state.config.val_batches * WORLD_SIZE)
+
+    state.tracker.log({
+        "val/loss": avg_loss,
+        "val/ce_loss": avg_ce,
+        "val/kl_loss": avg_kl,
+    }, step=step)
 
     return state
 
@@ -279,17 +307,13 @@ def save_checkpoint(state, step):
     ckpt_path = ckpt_dir / f"whole_{step}.pt"
 
     # Save all necessary states for a full resume
-    torch.save(
-        {
-            "step": step,
-            "model_state_dict": de_parallel(state.model).state_dict(),
-            "optimizer_state_dict": state.optimizer.state_dict(),
-            "scheduler_state_dict": state.scheduler.state_dict(),
-            "config": vars(state.config),
-        },
-        ckpt_path,
-    )
-
+    torch.save({
+        "step": step,
+        "model_state_dict": de_parallel(state.model).state_dict(),
+        "optimizer_state_dict": state.optimizer.state_dict(),
+        "scheduler_state_dict": state.scheduler.state_dict(),
+        "config": vars(state.config),
+    }, ckpt_path)
     LOGGER.info(f"Saved checkpoint to {ckpt_path}")
 
 
@@ -301,34 +325,34 @@ def train(state: TrainContext):
         torch.cuda.set_device(state.device)
     else:
         state.device = device_parse(state.config.device)
-
-
-    # Setup AMP dtype and GradScaler
-    config = state.config
-    init_seeds(config.seed)
-
-
-    dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[config.dtype]
-    use_amp = config.use_amp and state.device.type not in {"cpu", "mps"}
-    state.amp = use_amp
-    state.dtype = dtype
-    state.scaler = torch.amp.GradScaler(enabled=use_amp)
-
+    init_seeds(state.config.seed)
+    state.dtype = {
+        'float32': torch.float32,
+        'bfloat16': torch.bfloat16,
+        'float16': torch.float16
+    }[state.config.dtype]
+    state.config.amp = state.config.amp and state.device.type not in {"cpu", "mps"}
+    state.scaler = torch.amp.GradScaler(enabled=state.config.amp)
     state.teacher, state.model = setup_models(state)
-
     if DDP_ENABLED:
         state.model = DDP(state.model, device_ids=[LOCAL_RANK])
+
+    # num steps to do 100M tokens
+    num_steps = int(500 * 10**6 / (
+        state.config.seq_length
+        * state.config.batch_size
+        * WORLD_SIZE
+        * state.config.grad_accum_steps
+    ))
+    state.config.max_steps = min(state.config.max_steps, num_steps)
     state.optimizer = optim.AdamW(state.model.parameters(), lr=state.config.lr, weight_decay=state.config.weight_decay)
     state.scheduler = CosineAnnealingLR(state.optimizer, T_max=state.config.max_steps, eta_min=state.config.min_lr)
-    setup_dataloaders(state)
-
+    state = setup_dataloaders(state)
     print0("Starting training...")
     state.optimizer.zero_grad()
-
-    # Loop starts from `start_step`
     for step in range(state.config.max_steps):
-        training_step(state, step)
-        validation_step(state, step)
+        state = training_step(state, step)
+        state = validation_step(state, step)
         save_checkpoint(state, step + 1)
 
     print0("Training completed!")
@@ -364,11 +388,10 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=0.5, help="Weight for KL loss vs CE loss.")
     parser.add_argument("--temperature", type=float, default=2.0, help="Temperature scaling for distillation.")
     # Performance & Mixed Precision
-    parser.add_argument("--use_amp", action="store_true", help="Enable Automatic Mixed Precision (AMP).")
-    parser.add_argument("--amp_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], help="AMP data type (float16 or bfloat16).")
+    parser.add_argument("--amp", action="store_true", help="Enable Automatic Mixed Precision (AMP).")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], help="AMP data type (float16 or bfloat16).")
 
     # Logging and Saving
-    parser.add_argument("--log_interval", type=int, default=10, help="Steps between logging.")
     parser.add_argument("--save_interval", type=int, default=1000, help="Steps between saving checkpoints.")
     parser.add_argument("--val_interval", type=int, default=250, help="Steps between validation runs.")
     parser.add_argument("--val_batches", type=int, default=10, help="Number of batches to evaluate during validation.")
@@ -376,6 +399,8 @@ if __name__ == "__main__":
     # Student Model Configuration
     parser.add_argument("--factorization_rank", type=int, default=16, help="Low-rank factorization rank for approximated layers.")
     parser.add_argument("--layer_sharing", action="store_true", help="Enable weight sharing across student layers.")
+    parser.add_argument("--tracker", type=str)
+    parser.add_argument("--name", type=str)
     args = parser.parse_args()
 
     args = vars(args)

@@ -51,10 +51,3 @@ class DistributedDataLoader:
             self.current_position = B * T * R
         return x, y
 
-
-if __name__ == "__main__":
-    # Test run (CTRL + C to stop obviously)
-    dataloader = DistributedDataLoader(path=Path("data/edu_fineweb10B"), batch_size=8, seq_len=1024, split='train')
-    x, y = dataloader.next_batch()
-    for i in range(1000):
-        x, y = dataloader.next_batch()

@@ -6,23 +6,24 @@ params:
   device: cuda
 
   # Training settings
-  max_steps: 1000
-  batch_size: 12 # (Rank, Optimal BS) = (128, 8), (64, 16), (32, 32), (16, 64)
+  max_steps: 10000000
+  batch_size: 18 # (Rank, Optimal BS) = (128, 18), (64, 16), (32, 32), (16, 64)
   seq_length: 512
-  gradient_accumulation_steps: 4
-  learning_rate: 0.001
-  min_learning_rate: 0.00001
+  grad_accum_steps: 4
+  lr: 0.001
+  min_lr: 0.00001
   weight_decay: 0.00001
   warmup_steps: 100
   grad_clip: 1.0
 
   # Logging & saving
-  log_interval: 10
-  save_interval: 100
+  save_interval: 10
   val_interval: 250
   val_batches: 10
 
   # Distillation-specific
   factorization_rank: 128
   layer_sharing: true
-  use_dataparallel: false
+  # Tracker
+  tracker: "wandb"
+  project: "attention-approximation"

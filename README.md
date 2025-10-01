@@ -4,9 +4,6 @@
 TODOs:
 
 - distill_individual_layers.py
-    - Check why get OOM when in DDP
-    - Uniform loss, logging code with whole model distillation script
-    - Add tracker (e.g. wandb) to plot loss curves and other stuff
     - On [RADLADS](https://arxiv.org/pdf/2505.03005) layer distillation was done for about 100M tokens with lr cosine from 1e-3 to 1e-5 with bs=32
     - To train 100M tokens if bs=16, seq_len=512 and grad_acc=4 then 100M/(16*512*4)= ~3052 steps
     - Need to check convergence of loss with different rank
