@@ -71,74 +71,38 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-        
-class CP(nn.Module):
-    def __init__(self, rank: int, out_units: int = 1):
-        super().__init__()
-        self.rank = int(rank)
-        self.out_units = int(out_units)
-        self.weight = nn.Parameter(torch.ones(self.out_units, self.rank), requires_grad=False)
 
-    def forward(self, hadamard: torch.Tensor) -> torch.Tensor:
-        return hadamard @ self.weight.t()
 
 class CPCircuitLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, chunk_size: int = 1_000):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.out_units = 1
         self.rank = config.factorization_rank
-        self.num_head = config.num_attention_heads
-        self.chunk_size = chunk_size
+        self.num_heads = config.num_attention_heads
+        self.out_units = 1
 
-        self.seq_mode_factor_1 = nn.Linear(
-            config.hidden_size, config.factorization_rank, bias=config.attention_bias
-        )
-        self.seq_mode_factor_2 = nn.Linear(
-            config.hidden_size, config.factorization_rank, bias=config.attention_bias
-        )
+        self.seq_mode_factor_1 = nn.Linear(config.hidden_size, self.rank, bias=config.attention_bias)
+        self.seq_mode_factor_2 = nn.Linear(config.hidden_size, self.rank, bias=config.attention_bias)
 
-        self.num_head_mode = nn.Parameter(
-            torch.empty(self.num_head, config.factorization_rank)
-            )
-        
+        self.num_head_mode = nn.Parameter(torch.empty(self.num_heads, self.rank))
         init.normal_(self.num_head_mode, mean=0.0, std=0.02)
 
-        self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
+        # projection weight (out_units × rank), frozen in your original
+        self.weight = nn.Parameter(torch.ones(self.out_units, self.rank), requires_grad=False)
 
-    def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_size = hidden_states.size()
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.shape
 
-        all_indices = all_indices.to(hidden_states.device)
+        seq_emb_1 = self.seq_mode_factor_1(hidden_states)  # [b, i, r]
+        seq_emb_2 = self.seq_mode_factor_2(hidden_states)  # [b, j, r]
+        head_emb = self.num_head_mode                     # [h, r]
 
-        seq_embeddings_1 = self.seq_mode_factor_1(hidden_states)
-        seq_embeddings_2 = self.seq_mode_factor_2(hidden_states)
+        # Fuse Hadamard product and CP projection into one einsum
+        # Instead of bhijr -> bhij*out_units, we go directly
+        # seq1 * seq2 * head * weight
+        out = torch.einsum("bir,bjr,hr,or->bhijo", seq_emb_1, seq_emb_2, head_emb, self.weight)
 
-        outputs = []
-        for start in range(0, all_indices.size(0), self.chunk_size):
-            end = min(start + self.chunk_size, all_indices.size(0))
-            chunk = all_indices[start:end]  # [chunk_size, 2]
+        return out.squeeze(-1)  # [batch, heads, seq_len, seq_len]
 
-            head_indices= chunk[:, 0].long()
-            seq_indices_1 = chunk[:, 1].long()  
-            seq_indices_2 = chunk[:, 2].long()  
-            # Gather sequence embeddings for batch
-            seq_emb_1 = seq_embeddings_1[:, seq_indices_1]  # [batch, chunk_size, rank]
-            seq_emb_2 = seq_embeddings_2[:, seq_indices_2]  # [batch, chunk_size, rank]
-
-            # Gather hidden embeddings (shared across batch)
-            num_head_emb = self.num_head_mode[head_indices]  # [chunk_size, rank]
-            num_head_emb = num_head_emb.unsqueeze(0).expand(batch, -1, -1)  # [batch, chunk_size, rank]
-
-            # Hadamard product
-            hadamard = num_head_emb * seq_emb_1 * seq_emb_2 # [batch, chunk_size, rank]
-
-            # CP projection
-            out_chunk = self.cp(hadamard)  # [batch, chunk_size, out_units]
-            outputs.append(out_chunk)
-
-        out = torch.cat(outputs, dim=1)  # [batch, total_size, out_units]
-
-        return out.view(batch, self.num_head, seq_len, seq_len, self.out_units).squeeze(4)
 
 class LlamaAttention(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
@@ -148,7 +112,7 @@ class LlamaAttention(nn.Module):
         if layer_idx is None:
             print(f"Instantiating {self.__class__.__name__} without `layer_idx` is not recommended.")
 
-        self.cp_circuit = CPCircuitLayer(config=config, chunk_size=10_000)
+        self.cp_circuit = CPCircuitLayer(config=config)
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -170,13 +134,12 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        all_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
         
         bsz, q_len, _ = hidden_states.size()
 
         value_states = self.v_proj(hidden_states)
-        attn_weights = self.cp_circuit(hidden_states, all_indices)
+        attn_weights = self.cp_circuit(hidden_states)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -221,7 +184,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
-        all_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
         residual = hidden_states
@@ -233,7 +195,6 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
-            all_indices=all_indices
         )
         hidden_states = residual + hidden_states
 
@@ -328,21 +289,13 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = self._update_causal_mask(
             attention_mask=attention_mask,
             input_tensor=inputs_embeds,
-            output_attentions=output_attentions
         )
 
         hidden_states = inputs_embeds
 
         _, seq_len, _ = hidden_states.size()
-        device = hidden_states.device
 
-        grid_z, grid_y, grid_x = torch.meshgrid(
-            torch.arange(self.num_heads, dtype=torch.long, device=device),
-            torch.arange(seq_len, dtype=torch.long, device=device),
-            torch.arange(seq_len, dtype=torch.long, device=device),
-            indexing="ij"
-        )
-        all_indices = torch.stack([grid_z, grid_y, grid_x], dim=-1).view(-1, 3)
+
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -357,14 +310,12 @@ class LlamaModel(LlamaPreTrainedModel):
                     hidden_states,
                     causal_mask,
                     output_attentions,
-                    all_indices=all_indices
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
                     output_attentions=output_attentions,
-                    all_indices=all_indices
                 )
 
             hidden_states = layer_outputs[0]
@@ -382,14 +333,12 @@ class LlamaModel(LlamaPreTrainedModel):
                         hidden_states,
                         causal_mask,
                         output_attentions,
-                        all_indices=all_indices
                     )
                 else:
                     layer_outputs = decoder_layer(
                         hidden_states,
                         attention_mask=causal_mask,
                         output_attentions=output_attentions,
-                        all_indices=all_indices
                     )
 
                 hidden_states = layer_outputs[0]
@@ -435,3 +384,106 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
 
         return causal_mask
+    
+
+
+class LlamaForCausalLM(LlamaPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = LlamaModel(config)
+        self.vocab_size = config.vocab_size
+        if not getattr(self.config, "share_embedding", False):
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return (
+            self.lm_head
+            if not getattr(self.config, "share_embedding", False)
+            else self.get_input_embeddings()
+        )
+
+    def set_output_embeddings(self, new_embeddings):
+        if not getattr(self.config, "share_embedding", False):
+            self.lm_head = new_embeddings
+        else:
+            self.set_input_embeddings(new_embeddings)
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+    ) -> tuple | CausalLMOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        if self.config.pretraining_tp > 1:
+            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+            logits = torch.cat(logits, dim=-1)
+        else:
+            if not getattr(self.config, "share_embedding", False):
+                logits = self.lm_head(hidden_states)
+            else:
+                logits = F.linear(hidden_states, self.model.embed_tokens.weight)
+        logits = logits.float()
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states if hasattr(outputs, 'hidden_states') else None,
+        )
