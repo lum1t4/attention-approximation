@@ -13,13 +13,15 @@ def load_tokens(filename):
 
 
 class DistributedDataLoader:
-    def __init__(self, path: Path, batch_size: int, seq_len: int, split: str):
+    def __init__(self, path: str | Path, batch_size: int, seq_len: int, split: str):
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.rank = max(RANK, 0)
         self.num_processes = WORLD_SIZE
         self.current_shard = None
 
+        path = Path(path) if isinstance(path, str) else path
+        assert path.exists()
         # get the shard filenames
         shards = sorted((s for s in path.glob("shard_*") if split in s.name), key=lambda x: x.name)
         shards = [s.as_posix() for s in shards]
