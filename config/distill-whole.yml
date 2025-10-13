@@ -4,7 +4,7 @@ params:
 
   # Training Hyperparameters
   max_steps: 2000000 # 500M tokens with 4GPUs, B = 32, S = 512 and grad_accum = 4
-  batch_size: 18
+  batch_size: 16
   seq_length: 512  # Increased default to show value of chunking
   grad_accum_steps: 4
   lr: 0.0001
@@ -27,7 +27,7 @@ params:
   val_batches: 10
 
   # Student Model Configuration
-  factorization_rank: 128
+  factorization_rank: 16
   layer_sharing: false
 
   # Model and Data Paths
@@ -36,5 +36,5 @@ params:
   data_path: "data/minipile"
   from_checkpoint: "checkpoints/checkpoint_last.pt"
 
-  tracker: "wandb"
+  tracker: none
   project: "attention-approximation"

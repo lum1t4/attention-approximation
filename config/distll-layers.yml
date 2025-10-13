@@ -22,8 +22,8 @@ params:
   val_batches: 10
 
   # Distillation-specific
-  factorization_rank: 128
+  factorization_rank: 16
   layer_sharing: true
   # Tracker
-  tracker: "wandb"
+  tracker: null
   project: "attention-approximation"

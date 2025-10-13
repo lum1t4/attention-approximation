@@ -34,84 +34,9 @@ from attention_approximation.data import DistributedDataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from attention_approximation.trackers import Tracker, AutoTracker
+from attention_approximation.modeling_llama_approximated import LlamaAttention as LlamaApproximatedAttention
 
 DDP_ENABLED = WORLD_SIZE > 1
-
-class CP(nn.Module):
-    def __init__(self, rank: int, out_units: int = 1):
-        super().__init__()
-        self.rank = int(rank)
-        self.out_units = int(out_units)
-        self.register_buffer('weight', torch.ones(self.out_units, self.rank))
-
-    def forward(self, hadamard: torch.Tensor) -> torch.Tensor:
-        return hadamard @ self.weight.t()
-
-class CPCircuitLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, chunk_size: int = 1_000):
-        super().__init__()
-        self.out_units = 1
-        self.rank = config.factorization_rank
-        self.chunk_size = chunk_size
-
-        self.seq_mode_factor = nn.Linear(
-            config.hidden_size, config.factorization_rank, bias=config.attention_bias
-        )
-        # shape: [hidden_size, rank]
-        self.hidden_embeddings = nn.Parameter(
-            torch.empty(config.hidden_size, config.factorization_rank)
-            )
-        #initilaize with a small Gaussian like Transformers embeddings
-        init.normal_(self.hidden_embeddings, mean=0.0, std=0.02)
-
-        self.cp = CP(rank=config.factorization_rank, out_units=self.out_units)
-
-    def forward(self, hidden_states: torch.Tensor, all_indices: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_size = hidden_states.size()
-        device = hidden_states.device
-
-        # Move indices to correct device
-        all_indices = all_indices.to(device)
-
-        # seq_embeddings: [batch, seq_len, rank]
-        seq_embeddings = self.seq_mode_factor(hidden_states)
-
-        outputs = []
-        for start in range(0, all_indices.size(0), self.chunk_size):
-            end = min(start + self.chunk_size, all_indices.size(0))
-            chunk = all_indices[start:end]  # [chunk_size, 2]
-
-            seq_indices = chunk[:, 0].long()  # [chunk_size]
-            hidden_indices = chunk[:, 1].long()  # [chunk_size]
-
-            # Gather sequence embeddings for batch
-            seq_emb = seq_embeddings[:, seq_indices]  # [batch, chunk_size, rank]
-
-            # Gather hidden embeddings (shared across batch)
-            hidden_emb = self.hidden_embeddings[hidden_indices]  # [chunk_size, rank]
-            hidden_emb = hidden_emb.unsqueeze(0).expand(batch, -1, -1)  # [batch, chunk_size, rank]
-
-            # Hadamard product
-            hadamard = seq_emb * hidden_emb  # [batch, chunk_size, rank]
-
-            # CP projection
-            out_chunk = self.cp(hadamard)  # [batch, chunk_size, out_units]
-            outputs.append(out_chunk)
-
-        out = torch.cat(outputs, dim=1)  # [batch, total_size, out_units]
-
-        return out.view(batch, seq_len, hidden_size, self.out_units).squeeze(3)
-
-
-class LlamaApproximatedAttention(nn.Module):
-    def __init__(self, config: LlamaConfig, all_indices: torch.Tensor):
-        super().__init__()
-        self.all_indices = all_indices
-        self.cp_circuit = CPCircuitLayer(config=config, chunk_size=10_000)
-
-    def forward(self, hidden_states: torch.Tensor, **kargs) -> torch.Tensor:
-        attn_output = self.cp_circuit(hidden_states, self.all_indices)
-        return  attn_output
 
 
 @dataclass
@@ -167,7 +92,7 @@ class AttentionDistillationWrapper(nn.Module):
     """
     def __init__(self, student_att: Callable, teacher_att: nn.Module, config: LlamaConfig):
         super().__init__()
-        self.student_att = student_att(config=config, all_indices=config.all_indices)
+        self.student_att = student_att(config=config)
         self.teacher_att = teacher_att
         # Freeze teacher attention parameters
         for param in self.teacher_att.parameters():
@@ -225,16 +150,6 @@ def setup_model(state):
     model.load_state_dict(csd, strict=False)
     print0(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
     model.eval()
-
-    # Patch attention layers
-    grid_y, grid_x = torch.meshgrid(
-        torch.arange(state.config.seq_length, dtype=torch.long),
-        torch.arange(m_config.hidden_size, dtype=torch.long),
-        indexing="ij"
-    )
-    all_indices = torch.stack([grid_y, grid_x], dim=-1).view(-1, 2)
-    s_config.all_indices = all_indices.to(state.device)
-
     for i, layer in enumerate(model.model.layers):
         layer.self_attn = AttentionDistillationWrapper(
             student_att=LlamaApproximatedAttention,
@@ -378,7 +293,7 @@ def validate(state: TrainContext) -> float:
 @rank_zero_only
 def save_checkpoint(state, step):
     """Saves a training checkpoint"""
-    if step % state.config.save_interval == 0 or step == state.config.max_steps -1:
+    if (step + 1) % state.config.save_interval == 0 or step in {state.config.max_steps - 1, 0}:
         model = de_parallel(state.model)
         ckpt = Path(state.config.checkpoint_dir)
         ckpt.mkdir(exist_ok=True)
@@ -415,7 +330,6 @@ def train(state: TrainContext):
     state = setup_model(state)
     state.config.amp = state.device.type == "cuda" and state.config.amp
     print0("Starting training...")
-    state.optimizer.zero_grad()
     # num steps to do 100M tokens
     num_steps = int(100 * 10**6 / (
         state.config.seq_length

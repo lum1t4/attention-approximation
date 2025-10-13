@@ -14,7 +14,7 @@ model_config_path = "data/MobileLLM/config.json"
 data_path = "data/minipile"
 
 config = LLM0.config_class.from_json_file(model_config_path)
-config.factorization_rank = 8
+config.factorization_rank = 16
 config.layer_sharing = False
 config.seq_length = 512
 

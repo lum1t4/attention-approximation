@@ -3,7 +3,7 @@ from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherMo
 from attention_approximation.modeling_llama_approximated import LlamaForCausalLM as StudentModel
 
 import torch
-model_path = "checkpoints_full_model/whole_3390.pt"
+model_path = "checkpoints_full_model/whole_1070.pt"
 model_config = "data/MobileLLM/config.json"
 
 

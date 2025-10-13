@@ -46,7 +46,7 @@ class TrainingConfig:
     data_path: str = "data/edu_fineweb10B"
     checkpoint_dir: str = "checkpoints_full_model"
     # Student Model Configuration
-    factorization_rank: int = 128
+    factorization_rank: int = 16
     layer_sharing: bool = False
     seq_length: int = 512
 
@@ -81,6 +81,8 @@ print0(f"Transferred {len(csd)}/{len(teacher.state_dict())} items from pretraine
 config.factorization_rank = state.config.factorization_rank
 config.layer_sharing = state.config.layer_sharing
 config.seq_length = state.config.seq_length
+
+print(config)
 model = StudentModel(config)
 
 ckpt = torch.load(state.config.from_checkpoint, map_location="cpu")['model_state_dict']
@@ -107,3 +109,8 @@ assert len(csd) > 0, "No weights were transferred from the checkpoint. Please ch
 model.load_state_dict(csd, strict=False)
 model = torch.compile(model.to(state.device))
 LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
+
+torch.save({
+    "model": model.state_dict(),
+    "config": config.to_dict(),
+}, Path(state.config.from_checkpoint).parent / 'whole_start.pt')
