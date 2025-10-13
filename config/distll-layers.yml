@@ -20,6 +20,7 @@ params:
   save_interval: 10
   val_interval: 250
   val_batches: 10
+  val: "validation"
 
   # Distillation-specific
   factorization_rank: 16

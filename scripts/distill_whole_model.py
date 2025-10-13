@@ -23,6 +23,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from attention_approximation.data import DistributedDataLoader
 from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherModel
 from attention_approximation.modeling_llama_approximated import LlamaForCausalLM as StudentModel
+from attention_approximation.data import distribute_dataloader, TokenDataset
 from attention_approximation.pytorch import (
     LOCAL_RANK,
     RANK,
@@ -149,9 +150,13 @@ def setup_models(state: TrainContext):
 
 
 def setup_dataloaders(state: TrainContext):
-    state.train_loader = DistributedDataLoader(path=Path(state.config.data_path), batch_size=state.config.batch_size, seq_len=state.config.seq_length, split="train")
-    state.val_loader = DistributedDataLoader(path=Path(state.config.data_path), batch_size=state.config.batch_size, seq_len=state.config.seq_length, split=state.config.val)
-    return state
+    """Initializes the data loaders for training and validation."""
+    config = state.config
+    train_dataset = TokenDataset(config.data_path, seq_len=config.seq_length, split='train')
+    valid_dataset = TokenDataset(config.data_path, seq_len=config.seq_length, split=config.val)
+    train_loader = distribute_dataloader(train_dataset, batch=config.batch_size, mode="train")
+    valid_loader = distribute_dataloader(valid_dataset, batch=config.batch_size, mode="valid")
+    return train_loader, valid_loader
 
 def calculate_loss(
     student_logits: torch.Tensor,
@@ -190,6 +195,7 @@ def training_step(state: TrainContext, step: int):
     cum_kl_loss = 0.0
 
     for k in range(state.config.grad_accum_steps):
+        # TODO: fix loader since change
         x, y = state.train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         if DDP_ENABLED:
@@ -266,6 +272,7 @@ def validation_step(state: TrainContext, step: int):
     temperature = state.config.temperature
     
     for _ in range(state.config.val_batches):
+        # TODO: fix loader since change
         x, y = state.val_loader.next_batch()
         x, y = x.to(state.device), y.to(state.device)
 

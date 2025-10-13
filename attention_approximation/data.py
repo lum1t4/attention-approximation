@@ -1,55 +1,124 @@
-from pathlib import Path
-import torch
-import numpy as np
 import os
-from attention_approximation.pytorch import WORLD_SIZE, LOCAL_RANK, RANK
-from attention_approximation.utils import LOGGER
+import struct
+from dataclasses import dataclass
+from io import BufferedReader, BufferedWriter
+from pathlib import Path
+from typing import Literal
 
-def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32) # added after video
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from attention_approximation.pytorch import RANK, DistributedEvalSampler, seed_worker
+
+"""
+WARNING: while taking as reference the followings
+- https://github.com/recursal/RADLADS-paper
+- https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/datasets/indexed_dataset.py
+binaries were not thought to be compatible either the compability has been verified.
+It was prefered to keep things simple and understandable at glace.
+"""
+
+INDEX_HEADER = b"MMIDIDX\x00\x00"
+INDEX_VERSION = 1
 
 
-class DistributedDataLoader:
-    def __init__(self, path: str | Path, batch_size: int, seq_len: int, split: str):
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.rank = max(RANK, 0)
-        self.num_processes = WORLD_SIZE
-        self.current_shard = None
+@dataclass
+class TokenDatasetIndex:
+    token_count: int
+    token_byte_size: int
+    document_count: int
+    document_lenghts: np.ndarray
+    document_offsets: np.ndarray
+    version: int = INDEX_VERSION
 
+    @property
+    def token_dtype(self):
+        return np.uint16 if self.token_byte_size == 2 else np.uint32
+
+    def save(self, file: BufferedWriter | str | Path):
+        fd = file if isinstance(file, BufferedWriter) else open(file, 'wb')
+        fd.write(INDEX_HEADER)
+        fd.write(struct.pack("<Q", INDEX_VERSION))
+        fd.write(struct.pack("<B", self.token_byte_size))
+        fd.write(struct.pack("<Q", self.document_count))
+        fd.write(self.document_lenghts.tobytes(order="C"))
+        fd.write(self.document_offsets.tobytes(order="C"))
+        # if the file descriptor is passed, let the user decide when and where close it
+        if not isinstance(file, BufferedWriter):
+            fd.close()
+        return
+
+    @staticmethod
+    def load(file: BufferedReader | str | Path):
+        fd = file if isinstance(file, BufferedReader) else open(file, 'rb')
+        assert fd.read(9) == INDEX_HEADER, "Header mismatch"
+        version,  = struct.unpack("<Q", fd.read(8)) # index version
+        byte_size, = struct.unpack("<B", fd.read(1)) # token byte size
+        count, = struct.unpack("<Q", fd.read(8)) # document count
+        lenghts = np.frombuffer(fd.read(count * 4), dtype=np.int32) # token per document
+        offsets = np.frombuffer(fd.read(count * 8), dtype=np.int64) # pointers to documents
+        # if the file descriptor is passed, let the user decide when and where close it
+        if not isinstance(file, BufferedWriter):
+            fd.close()
+        return TokenDatasetIndex(
+            version=version,
+            token_count=sum(lenghts),
+            token_byte_size=byte_size,
+            document_count=count,
+            document_lenghts=lenghts,
+            document_offsets=offsets
+        )
+
+
+class TokenDataset(torch.utils.data.Dataset):
+    index: TokenDatasetIndex
+
+    def __init__(self, path: str | Path, seq_len: int = 512, split: str = "train"):
+        super().__init__()
         path = Path(path) if isinstance(path, str) else path
-        assert path.exists()
-        # get the shard filenames
-        shards = sorted((s for s in path.glob("shard_*") if split in s.name), key=lambda x: x.name)
-        shards = [s.as_posix() for s in shards]
-        assert len(shards) > 0, f"no shards found for split {split}"
-        self.shards = shards
-        if LOCAL_RANK in {-1, 0}:
-            LOGGER.info(f"Found {len(shards)} shards for split {split}")
-        self.reset()
+        index_path = path / f'index-{split}.bin'
+        token_path = path / f'dataset-{split}.bin'
+        assert index_path.exists(), "Could not find index"
+        assert token_path.exists(), "Could not find token corpus"
 
-    def reset(self):
-        if self.current_shard != 0:
-            self.current_shard = 0
-            self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.batch_size * self.seq_len * self.rank
+        self.seq_len = seq_len
+        self.index = TokenDatasetIndex.load(index_path)
+        self.bucket = np.memmap(token_path, dtype=self.index.token_dtype, mode="r")
 
-    def next_batch(self):
-        B, T = self.batch_size, self.seq_len
-        R, W = self.rank, self.num_processes
+    def __getitem__(self, idx: int):
+        start = idx * self.seq_len
+        end = start + self.seq_len
+        # Load the token sequence
+        tokens = torch.tensor(self.bucket[start:end + 1], dtype=torch.long)
+        return tokens[:-1], tokens[1:]
 
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the position in the tensor
-        self.current_position += B * T * W
-        # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T * W + 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * R
-        return x, y
+    def __len__(self):
+        return self.index.token_count // self.seq_len
 
+
+def distribute_dataloader(
+    dataset: Dataset,
+    batch: int = 16,
+    workers: int = 8,
+    shuffle: bool = True,
+    pin_memory: bool = True,
+    mode: Literal["train", "valid", "test"] = "train",
+) -> DataLoader:
+    bs = min(batch, len(dataset))
+    nd = torch.cuda.device_count()  # number of CUDA devices
+    nw = min([os.cpu_count() // max(nd, 1), bs if bs > 1 else 0, workers])  # number of workers
+
+    distributed = DistributedSampler if mode == "train" else DistributedEvalSampler
+    sampler = distributed(dataset, shuffle=shuffle) if RANK != -1 else None
+    generator = torch.Generator()
+    generator.manual_seed(6148914691236517205 + RANK)
+    return DataLoader(
+        dataset,
+        batch_size=bs,
+        shuffle=shuffle and sampler is None,
+        num_workers=nw,
+        sampler=sampler,
+        pin_memory=pin_memory,
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )

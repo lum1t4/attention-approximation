@@ -30,7 +30,7 @@ from attention_approximation.pytorch import (
     init_seeds,
 )
 from attention_approximation.utils import LOGGER, yaml_load
-from attention_approximation.data import DistributedDataLoader
+from attention_approximation.data import distribute_dataloader, TokenDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from attention_approximation.trackers import Tracker, AutoTracker
@@ -177,21 +177,14 @@ def setup_model(state):
     return state
 
 
-def setup_dataloaders(state):
+def setup_dataloaders(state: TrainContext):
     """Initializes the data loaders for training and validation."""
-    train_loader = DistributedDataLoader(
-        path=Path(state.config.data_path),
-        batch_size=state.config.batch_size,
-        seq_len=state.config.seq_length,
-        split='train'
-    )
-    val_loader = DistributedDataLoader(
-        path=Path(state.config.data_path),
-        batch_size=state.config.batch_size,
-        seq_len=state.config.seq_length,
-        split=state.config.val
-    )
-    return train_loader, val_loader
+    config = state.config
+    train_dataset = TokenDataset(config.data_path, seq_len=config.seq_length, split='train')
+    valid_dataset = TokenDataset(config.data_path, seq_len=config.seq_length, split=config.val)
+    train_loader = distribute_dataloader(train_dataset, batch=config.batch_size, mode="train")
+    valid_loader = distribute_dataloader(valid_dataset, batch=config.batch_size, mode="valid")
+    return train_loader, valid_loader
 
 
 def training_step(state: TrainContext, step: int):
@@ -205,6 +198,7 @@ def training_step(state: TrainContext, step: int):
     cum_loss = 0.0
 
     for k in range(state.config.grad_accum_steps):
+        # TODO: fix loader since change
         x, y = state.train_loader.next_batch()
         x, y = x.to(state.device, non_blocking=True), y.to(state.device, non_blocking=True)
         if DDP_ENABLED:
@@ -272,6 +266,7 @@ def validate(state: TrainContext) -> float:
     state.model.eval()
     total_loss = torch.tensor(0.0, device=state.device, requires_grad=False)
     for _ in range(state.config.val_batches):
+        # TODO: fix loader since change
         x, y = state.val_loader.next_batch()
         x, y = x.to(state.device), y.to(state.device)
         _ = state.model(x, labels=y)
