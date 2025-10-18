@@ -1,30 +1,38 @@
 params:
-  model_config_path: data/MobileLLM/config.json
-  model_weights_path: data/MobileLLM/model.safetensors
-  data_path: data/minipile
+  # Model and Data Paths
+  model_config_path: "data/MobileLLM/config.json"
+  model_weights_path: "data/MobileLLM/model.safetensors"
+  data_path: "data/minipile"
   checkpoint_dir: checkpoints
   device: cuda
 
   # Training settings
-  max_steps: 10000000
-  batch_size: 18 # (Rank, Optimal BS) = (128, 18), (64, 16), (32, 32), (16, 64)
+  # 100M tokens / (512 seq_length * 16 batch_size * 8 grad_accum_steps * 4 world size) ~= 381 steps
+  max_steps: 400
+  seed: 1337
+  amp: true
+  dtype: "bfloat16"  # float16 or bfloat16
+  workers: 1
+  batch_size: 16
   seq_length: 512
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   lr: 0.001
   min_lr: 0.00001
   weight_decay: 0.00001
-  warmup_steps: 100
   grad_clip: 1.0
 
-  # Logging & saving
-  save_interval: 10
-  val_interval: 250
-  val_batches: 10
+  # Monitoring, Logging & saving
   val: "validation"
+  save_interval: 10
+  val_interval: 50
 
-  # Distillation-specific
-  factorization_rank: 16
-  layer_sharing: true
+  # Student Model Configuration
+  factorization_rank: 128
+  layer_sharing: false
+
   # Tracker
   tracker: null
   project: "attention-approximation"
+
+  # To review
+  warmup_steps: 100

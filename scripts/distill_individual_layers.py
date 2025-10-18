@@ -30,59 +30,15 @@ from attention_approximation.pytorch import (
     init_seeds,
 )
 from attention_approximation.utils import LOGGER, yaml_load
-from attention_approximation.data import distribute_dataloader, TokenDataset
+from attention_approximation.data import distributed_dataloader, TokenDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from attention_approximation.trackers import Tracker, AutoTracker
 from attention_approximation.modeling_llama_approximated import LlamaAttention as LlamaApproximatedAttention
+from attention_approximation.base import BaseTrainConfig, BaseTrainContext, setup_dataloaders, save_checkpoint, print0
 
-DDP_ENABLED = WORLD_SIZE > 1
-
-
-@dataclass
-class TrainingConfig:
-    """Stores all hyperparameters and configuration settings."""
-    # Model and Data Paths
-    model_config_path: str = "data/MobileLLM/config.json"
-    model_weights_path: str = "data/MobileLLM/model.safetensors"
-    data_path: str = "data/minipile"
-    checkpoint_dir: str = "checkpoints"
-    val: str = "test"
-    device: str = "cuda"
-    # Training Hyperparameters
-    max_steps: int = 10000
-    seed: int = 42
-    batch_size: int = 2
-    seq_length: int = 128
-    grad_accum_steps: int = 4
-    lr: float = 1e-3
-    min_lr: float = 1e-5
-    weight_decay: float = 1e-5
-    warmup_steps: int = 100
-    grad_clip: float = 1.0
-    amp: bool = True
-
-    # Logging and Saving
-    save_interval: int = 1000
-    val_interval: int = 250
-    val_batches: int = 10
-
-    # Student Model Configuration
-    factorization_rank: int = 16
-    layer_sharing: bool = False
-
-    tracker: str = None
-    project: str = "attention-approximation"
-    name: str = None
-
-
-# Enable TF32 for faster matmuls on Ampere+ GPUs
-torch.set_float32_matmul_precision('high')
-
-
-@rank_zero_only
-def print0(s: str):
-    LOGGER.info(s)
+TrainingConfig = BaseTrainConfig
+TrainContext = BaseTrainContext
 
 
 class AttentionDistillationWrapper(nn.Module):
@@ -120,239 +76,169 @@ class AttentionDistillationWrapper(nn.Module):
         return self
 
 
-class TrainContext:
-    config: TrainingConfig
-    model: nn.Module | nn.parallel.DistributedDataParallel
-    device: torch.device
-    tracker: Tracker
-
-    def __init__(self, config: TrainingConfig):
-        self.config = config
-        self.tracker = AutoTracker(name=config.tracker, config=vars(config))
-
-
-
-def setup_model(state):
+def setup_models(ctx: TrainContext):
     """Loads, patches, and prepares the model for training."""
     # model, train, student configs
-    m_config = LlamaConfig().from_json_file(state.config.model_config_path)
-    m_config.use_cache = False
-    t_config = state.config
-    s_config = copy(m_config)
-    s_config.factorization_rank = state.config.factorization_rank
-    s_config.layer_sharing = state.config.layer_sharing
-    s_config.seq_length = state.config.seq_length
+    model_config = LlamaConfig().from_json_file(ctx.config.model_config_path)
+    model_config.use_cache = False
+    teacher_config = ctx.config
+    student_config = copy(model_config)
+    student_config.factorization_rank = ctx.config.factorization_rank
+    student_config.layer_sharing = ctx.config.layer_sharing
+    student_config.seq_length = ctx.config.seq_length
 
     # Load teacher model
-    model = TeacherModel(m_config)
-    checkpoint = safetensors.torch.load_file(t_config.model_weights_path)
+    model = TeacherModel(model_config)
+    checkpoint = safetensors.torch.load_file(teacher_config.model_weights_path)
     csd = intersect_dicts(checkpoint, model.state_dict())
     model.load_state_dict(csd, strict=False)
     print0(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
     model.eval()
+
+    student_params = []
+    teacher_params = []
     for i, layer in enumerate(model.model.layers):
         layer.self_attn = AttentionDistillationWrapper(
             student_att=LlamaApproximatedAttention,
             teacher_att=layer.self_attn,
-            config=s_config
+            config=student_config
         )
-        if LOCAL_RANK in {-1, 0}:
-            LOGGER.info(f"Replaced attention in layer {i}")
+        student_params.extend(layer.self_attn.student_att.parameters())
+        teacher_params.extend(layer.self_attn.teacher_att.parameters())
+        print0(f"Replaced attention in layer {i}")
 
-    model = model.to(state.device)
+    model = model.to(ctx.device)
     model = torch.compile(model)
     
-    student_params = []
-    for layer in model.model.layers:
-        student_params.extend(layer.self_attn.student_att.parameters())
-
-    if DDP_ENABLED:
+    if WORLD_SIZE > 1:
         model = DDP(model, device_ids=[LOCAL_RANK])
-    state.model = model
-    state.student_params = student_params
-    num_trainable_params = sum(p.numel() for p in student_params)
-    print0(f"Total student parameters to train: {num_trainable_params:,}")
-    state.tracker.log("model/trainable_params", num_trainable_params)
-    state.tracker.log("model/factorization_rank", t_config.factorization_rank)
-    return state
+    ctx.model = model
+    ctx.student_params = student_params
+    student_num_params = sum(p.numel() for p in student_params)
+    teacher_num_params = sum(p.numel() for p in teacher_params)
+    print0(f"Total student parameters to train: {student_num_params:,} from teacher params {teacher_num_params:,}")
+    ctx.tracker.log("model/trainable_params", student_num_params)
+    ctx.tracker.log("model/factorization_rank", teacher_config.factorization_rank)
+    return ctx
 
 
-def setup_dataloaders(state: TrainContext):
-    """Initializes the data loaders for training and validation."""
-    config = state.config
-    train_dataset = TokenDataset(config.data_path, seq_len=config.seq_length, split='train')
-    valid_dataset = TokenDataset(config.data_path, seq_len=config.seq_length, split=config.val)
-    train_loader = distribute_dataloader(train_dataset, batch=config.batch_size, mode="train")
-    valid_loader = distribute_dataloader(valid_dataset, batch=config.batch_size, mode="valid")
-    return train_loader, valid_loader
-
-
-def training_step(state: TrainContext, step: int):
+def training_step(ctx: TrainContext, step: int):
     """Performs a single training step, including forward and backward passes."""
     # Forward pass is performed through the possibly-wrapped model
-    state.model.train()
-
+    ctx.model.train()
     t0 = time.time()
-    state.optimizer.zero_grad()
-    device, amp = state.device, state.config.amp
+    ctx.optimizer.zero_grad()
+    device, amp = ctx.device, ctx.config.amp
     cum_loss = 0.0
 
-    for k in range(state.config.grad_accum_steps):
-        # TODO: fix loader since change
-        x, y = state.train_loader.next_batch()
-        x, y = x.to(state.device, non_blocking=True), y.to(state.device, non_blocking=True)
-        if DDP_ENABLED:
+    for k in range(ctx.config.grad_accum_steps):
+        x, y = next(ctx.train_iterator)
+        x, y = x.to(ctx.device, non_blocking=True), y.to(ctx.device, non_blocking=True)
+        if WORLD_SIZE > 1:
             # Avoid unnecessary gradient syncs
-            state.model.require_backward_grad_sync = (k == state.config.grad_accum_steps - 1)
+            ctx.model.require_backward_grad_sync = (k == ctx.config.grad_accum_steps - 1)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-            state.model(x)
+            ctx.model(x)
             loss = torch.tensor(0.0, device=device, requires_grad=False)
             num_att_layers = 0
-            for layer in de_parallel(state.model).model.layers:
+            for layer in de_parallel(ctx.model).model.layers:
                 if hasattr(layer.self_attn, 'last_distillation_loss'):
                     num_att_layers += 1
                     loss += layer.self_attn.last_distillation_loss
-            loss /= (state.config.grad_accum_steps * num_att_layers)
+            loss /= (ctx.config.grad_accum_steps * num_att_layers)
             cum_loss += loss.detach()
             # Backward pass
-            state.scaler.scale(loss).backward()
+            ctx.scaler.scale(loss).backward()
 
-    if DDP_ENABLED:
+    if WORLD_SIZE > 1:
         dist.all_reduce(cum_loss, op=dist.ReduceOp.AVG)
         cum_loss = cum_loss.item()
 
-    
-    state.scaler.unscale_(state.optimizer)
-    torch.nn.utils.clip_grad_norm_(state.student_params, state.config.grad_clip)
-    state.scaler.step(state.optimizer)
-    state.scaler.update()
-    state.optimizer.zero_grad()
+    # Optimization step
+    ctx.scaler.unscale_(ctx.optimizer)
+    norm = torch.nn.utils.clip_grad_norm_(ctx.model.parameters(), max_norm=ctx.config.grad_clip)
+    ctx.scaler.step(ctx.optimizer)
+    ctx.scaler.update()
+    ctx.optimizer.zero_grad()
+    ctx.scheduler.step()
 
     device_synchronize(device)
-    dt = time.time() - t0
-    lr = state.scheduler.get_last_lr()[0]
-    tokens_per_second = (
-        state.config.grad_accum_steps
-        * WORLD_SIZE
-        * state.config.batch_size
-        * state.config.seq_length
-    ) / dt
-    print0(
-        f"step {step+1}/{state.config.max_steps} | "
-        f"distill Loss: {cum_loss:.4f}  | "
-        f"lr: {lr:.2e} | "
-        f"tokens/s: {tokens_per_second:.0f} | "
-        f"mem {device_memory_used(state.device):.2f} GB | "
-        f"bs {state.config.batch_size}x{WORLD_SIZE} | "
-        f"factorization_rank {state.config.factorization_rank}" 
-    )
 
-    state.tracker.log({
+
+    dt = time.time() - t0
+    lr = ctx.scheduler.get_last_lr()[0]
+    tokens_per_second = ctx.config.grad_accum_steps * WORLD_SIZE * ctx.config.batch_size * ctx.config.seq_length / dt
+
+    metrics = {
         "train/loss": cum_loss,
         "train/lr": lr,
-        "train/tokens_per_sec": tokens_per_second,
-        "train/mem_used": device_memory_used(state.device)
-    }, step=step)
+        "train/norm": norm,
+        "train/tokens_per_second": tokens_per_second,
+        "train/mem": device_memory_used(ctx.device),
+    }
 
-    gc.collect()
-    device_memory_clear(state.device)
-    return cum_loss
+    print0(
+        f"step {step+1:4d}/{ctx.config.max_steps}"
+        f" | loss {metrics['train/loss']:.6f}"
+        f" | lr {metrics['train/lr']:.2e}"
+        f" | norm {metrics['train/norm']:.4f}"
+        f" | tokens_per_second {metrics['train/tokens_per_second']:.0f}"
+        f" | dt {(dt)*1000:.2f} ms"
+        f" | mem {metrics['train/mem']:2f} GB"
+    )
+
+    ctx.tracker.log(metrics, step=step)
+    return ctx
 
 
 @torch.inference_mode()
-def validate(state: TrainContext) -> float:
+def validation_step(ctx: TrainContext, step: int) -> float:
     """Runs the validation loop and returns the average loss."""
     # Ensure model is in a consistent state for validation
-    state.model.eval()
-    total_loss = torch.tensor(0.0, device=state.device, requires_grad=False)
-    for _ in range(state.config.val_batches):
-        # TODO: fix loader since change
-        x, y = state.val_loader.next_batch()
-        x, y = x.to(state.device), y.to(state.device)
-        _ = state.model(x, labels=y)
-        model = de_parallel(state.model)
+    ctx.model.eval()
+    if (step + 1) % ctx.config.val_interval != 0:
+        return ctx
+
+    loss = torch.zeros(1, device=ctx.device)
+    for batch_idx, (x, y) in enumerate(ctx.valid_loader):
+        x, y = x.to(ctx.device), y.to(ctx.device)
+        _ = ctx.model(x)
         # Collect distillation losses for validation
-        step_loss = torch.tensor(0.0, device=state.device, requires_grad=False)
+        step_loss = torch.zeros(1, device=ctx.device)
         num_att_layers = 0
-        for layer in model.model.layers:
+        for layer in de_parallel(ctx.model).model.layers:
             if hasattr(layer.self_attn, 'last_distillation_loss'):
                 step_loss += layer.self_attn.last_distillation_loss
                 num_att_layers += 1
 
         if num_att_layers > 0:
-            total_loss += (step_loss / num_att_layers)
+            loss += (step_loss / num_att_layers)
 
-    return (total_loss / state.config.val_batches).item()
-
-
-@rank_zero_only
-def save_checkpoint(state, step):
-    """Saves a training checkpoint"""
-    if (step + 1) % state.config.save_interval == 0 or step in {state.config.max_steps - 1, 0}:
-        model = de_parallel(state.model)
-        ckpt = Path(state.config.checkpoint_dir)
-        ckpt.mkdir(exist_ok=True)
-        import io
-        buffer = io.BytesIO()
-
-        torch.save({
-            'step': step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': state.optimizer.state_dict(),
-            'scheduler_state_dict': state.scheduler.state_dict(),
-        }, buffer)
-        (ckpt / f"checkpoint_last.pt").write_bytes(buffer.getvalue())
-        ckpt = ckpt / f"checkpoint_step_{step + 1}.pt"
-        (ckpt).write_bytes(buffer.getvalue())
-        LOGGER.info(f"Saved checkpoint to {ckpt}")
-
-    return state
+    metrics = {"valid/loss": (loss / len(ctx.valid_loader)).item()}
+    print0(f"step {step+1:4d}/{ctx.config.max_steps}  | valid/loss {metrics['valid/loss']:.6f}")
+    ctx.tracker.log(metrics, step=step)
+    return ctx
 
 
-def train(state: TrainContext):
+def train(ctx: TrainContext):
     """The main training loop."""
-    import os
-    os.environ['WANDB_MODE'] = 'offline'
-    os.environ['OMP_NUM_THREADS'] = "1"
-    if DDP_ENABLED:
-        dist.init_process_group(backend="nccl")
-        state.device = torch.device(f"cuda:{LOCAL_RANK}")
-        torch.cuda.set_device(LOCAL_RANK)
-    else:
-        state.device = device_parse(state.config.device)
-    
-    init_seeds(state.config.seed)
-    state = setup_model(state)
-    state.config.amp = state.device.type == "cuda" and state.config.amp
+    ctx = setup_models(ctx)
     print0("Starting training...")
-    # num steps to do 100M tokens
-    num_steps = int(100 * 10**6 / (
-        state.config.seq_length
-        * state.config.batch_size
-        * WORLD_SIZE
-        * state.config.grad_accum_steps
-    ))
-    state.config.max_steps = min(state.config.max_steps, num_steps)
-    state.optimizer = optim.AdamW(state.student_params, lr=state.config.lr, weight_decay=state.config.weight_decay)
-    state.scheduler = CosineAnnealingLR(state.optimizer, T_max=state.config.max_steps, eta_min=state.config.min_lr)
-    state.scaler = torch.amp.GradScaler(enabled=state.config.amp)
-    state.train_loader, state.val_loader = setup_dataloaders(state)
+    ctx.optimizer = optim.AdamW(ctx.student_params, lr=ctx.config.lr, weight_decay=ctx.config.weight_decay)
+    ctx.scheduler = CosineAnnealingLR(ctx.optimizer, T_max=ctx.config.max_steps, eta_min=ctx.config.min_lr)
+    ctx = setup_dataloaders(ctx)
+    ctx.train_iterator = iter(ctx.train_loader)
 
-    for step in range(num_steps):
-        loss = training_step(state, step)
-        if (step + 1) % state.config.val_interval == 0:
-            val_loss = validate(state)
-            print0(f"Validation Distill Loss: {val_loss:.4f}")
-        
-        save_checkpoint(state, step + 1)
+    for step in range(ctx.config.max_steps):
+        ctx = training_step(ctx, step)
+        ctx = validation_step(ctx, step)
+        save_checkpoint(ctx, step)
+        gc.collect()
+        device_memory_clear(ctx.device)
 
-    if DDP_ENABLED:
+    if WORLD_SIZE > 1:
         dist.destroy_process_group()
-
-    gc.collect()
-    device_memory_clear(state.device)
     print0("Training completed!")
-
 
 
 if __name__ == "__main__":
@@ -364,10 +250,11 @@ if __name__ == "__main__":
     parser.add_argument("--model_config_path", type=str, help="Path to the LLaMA model config JSON file.")
     parser.add_argument("--model_weights_path", type=str, help="Path to the pretrained model weights (safetensors).")
     parser.add_argument("--data_path", type=str, help="Path to the training/validation dataset shards.")
-    parser.add_argument("--val", type=str, help="Dataset split to use for validation.")
     parser.add_argument("--checkpoint_dir", type=str, help="Directory to save checkpoints.")
+    parser.add_argument("--val", type=str, help="Dataset split to use for validation.")
     parser.add_argument("--device", type=str, help="Device to train on (cuda, cpu, mps).")
-
+    parser.add_argument("--seed", type=int, help="Random seed for reproducibility.")
+    
     # Training Hyperparameters
     parser.add_argument("--max_steps", type=int, help="Total number of training steps.")
     parser.add_argument("--batch_size", type=int, help="Batch size per process.")
@@ -382,11 +269,10 @@ if __name__ == "__main__":
     # Logging and Saving
     parser.add_argument("--save_interval", type=int, help="How often to save checkpoints (in steps).")
     parser.add_argument("--val_interval", type=int, help="How often to run validation (in steps).")
-    parser.add_argument("--val_batches", type=int, help="Number of validation batches to average over.")
 
     # Student Model Configuration
     parser.add_argument("--factorization_rank", type=int, help="Factorization rank for approximated attention.")
-    parser.add_argument("--layer_sharing", action="store_true", help="Enable layer sharing in student attention.")
+    # parser.add_argument("--layer_sharing", action="store_true", help="Enable layer sharing in student attention.")
 
     parser.add_argument("--tracker", type=str)
     parser.add_argument("--name", type=str)
@@ -396,12 +282,6 @@ if __name__ == "__main__":
     if args["config"]:
         base = yaml_load(args.pop("config"))['params']
         args = {**base, **args}  # Command-line args override config file
-    train_config = TrainingConfig(**args)
-    state = TrainContext(train_config)
-    train(state)
 
-# salloc -A IscrC_LAM-next -p boost_usr_prod --qos=boost_qos_lprod --gres=gpu:4 --mem=0 --time=10:00:00
-# srun --pty bash
-# cd $FAST/attention-approximation/ && source .venv/bin/activate
-# python scripts/distill_individual_layers.py --config "config/distll-layers.yml"
-# torchrun --standalone --nproc_per_node=4 scripts/distill_individual_layers.py --config "config/distll-layers.yml"
+    train_config = TrainingConfig(**args)
+    train(TrainContext(train_config))

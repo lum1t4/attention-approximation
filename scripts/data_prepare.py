@@ -82,10 +82,7 @@ def main(
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(
-        description="Prepare a HF Dataset to binary files " \
-        "to speed data loading during training"
-    )
+    parser = argparse.ArgumentParser(description="Prepare a HF Dataset to binary files to speed data loading during training")
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--name', type=str, required=False, help="Subset name, if the dataset has multiple subsets.")
     parser.add_argument('--split', type=str, default="train")

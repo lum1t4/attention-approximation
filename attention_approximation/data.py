@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from attention_approximation.pytorch import RANK, DistributedEvalSampler, seed_worker
 
 """
-WARNING: while taking as reference the followings
+WARNING: while taking as reference the followings:
 - https://github.com/recursal/RADLADS-paper
 - https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/datasets/indexed_dataset.py
 binaries were not thought to be compatible either the compability has been verified.
@@ -90,13 +90,17 @@ class TokenDataset(torch.utils.data.Dataset):
         end = start + self.seq_len
         # Load the token sequence
         tokens = torch.tensor(self.bucket[start:end + 1], dtype=torch.long)
+        # Ensure we have the full sequence length
+        if len(tokens) < self.seq_len + 1:
+            # Pad with zeros if needed (though this shouldn't happen with proper dataset sizing)
+            tokens = torch.nn.functional.pad(tokens, (0, self.seq_len + 1 - len(tokens)), value=0)
         return tokens[:-1], tokens[1:]
 
     def __len__(self):
         return self.index.token_count // self.seq_len
 
 
-def distribute_dataloader(
+def distributed_dataloader(
     dataset: Dataset,
     batch: int = 16,
     workers: int = 8,
@@ -121,4 +125,5 @@ def distribute_dataloader(
         pin_memory=pin_memory,
         worker_init_fn=seed_worker,
         generator=generator,
+        drop_last=True,  # Drop incomplete batches to prevent shape issues
     )

@@ -1,0 +1,2 @@
+torchrun --standalone --nproc_per_node=4 scripts/distill_individual_layers.py --config "config/distll-layers.yml" --max_steps 100
+torchrun --standalone --nproc_per_node=4 scripts/distill_whole_model.py --config "config/distill-whole.yml" --max_steps 250

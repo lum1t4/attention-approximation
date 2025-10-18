@@ -1,40 +1,42 @@
 params:
-  val: "test"
-  seed: 1337
-
-  # Training Hyperparameters
-  max_steps: 2000000 # 500M tokens with 4GPUs, B = 32, S = 512 and grad_accum = 4
-  batch_size: 16
-  seq_length: 512  # Increased default to show value of chunking
-  grad_accum_steps: 4
-  lr: 0.0001
-  min_lr: 0.00001
-  weight_decay: 0.00001
-  grad_clip: 10.0
-  device: "cuda"
-
-  # Distillation Hyperparameters
-  alpha: 0.5
-  temperature: 2.0
-
-  # Performance & Mixed Precision
-  amp: true
-  dtype: "bfloat16"  # float16 or bfloat16
-
-  # Logging and Saving
-  save_interval: 5
-  val_interval: 250
-  val_batches: 10
-
-  # Student Model Configuration
-  factorization_rank: 16
-  layer_sharing: false
-
   # Model and Data Paths
   model_config_path: "data/MobileLLM/config.json"
   model_weights_path: "data/MobileLLM/model.safetensors"
   data_path: "data/minipile"
-  from_checkpoint: "checkpoints/checkpoint_last.pt"
+  checkpoint_dir: checkpoints_full
+  device: cuda
 
-  tracker: none
+  # Training settings
+  # 500M tokens / (512 seq_length * 16 batch_size * 8 grad_accum_steps * 4 world size) ~= 1907 steps
+  max_steps: 2000
+  seed: 1337
+  amp: true
+  dtype: "bfloat16"  # float16 or bfloat16
+  workers: 1
+  batch_size: 16
+  seq_length: 512
+  grad_accum_steps: 8
+  lr: 0.001
+  min_lr: 0.00001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+
+  # Monitoring, Logging & saving
+  val: "validation"
+  save_interval: 50
+  val_interval: 250
+
+  # Student Model Configuration
+  factorization_rank: 128
+  layer_sharing: false
+
+  # Tracker
+  tracker: null
   project: "attention-approximation"
+
+  # To review
+  warmup_steps: 100
+  from_checkpoint: "checkpoints/last.pt"
+  # Distillation Hyperparameters
+  alpha: 0.5
+  temperature: 2.0

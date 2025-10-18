@@ -343,4 +343,4 @@ $RECYCLE.BIN/
 data/
 checkpoints/
 wandb/
-checkpoints_full_model/
+checkpoints_full/
