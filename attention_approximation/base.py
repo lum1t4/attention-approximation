@@ -5,7 +5,7 @@ from torch import nn
 from attention_approximation.trackers import Tracker, AutoTracker
 from attention_approximation.pytorch import (
     WORLD_SIZE, LOCAL_RANK, device_parse, init_seeds,
-    rank_zero_only, de_parallel
+    rank_zero_only, de_parallel, intersect_dicts
 )
 from attention_approximation.data import distributed_dataloader, TokenDataset
 from pathlib import Path
@@ -52,7 +52,7 @@ class BaseTrainConfig:
 
     min_lr: float = 1e-5
     warmup_steps: int = 100
-
+    resume: str = None
 
 class BaseTrainContext:
     model: nn.Module | nn.parallel.DistributedDataParallel
@@ -65,6 +65,7 @@ class BaseTrainContext:
     valid_loader: torch.utils.data.DataLoader | None
     scaler: torch.cuda.amp.GradScaler
     distributed: bool = WORLD_SIZE > 1
+    start: int = 0
 
     def __init__(self, config: BaseTrainConfig):
         import os
@@ -128,15 +129,40 @@ def save_checkpoint(ctx: BaseTrainContext, step: int):
         ckpt.mkdir(exist_ok=True)
         buffer = io.BytesIO()
 
-        torch.save({
+        content = {
             'step': step,
             'model_state_dict': model_state,
             'optimizer_state_dict': ctx.optimizer.state_dict(),
             'scheduler_state_dict': ctx.scheduler.state_dict(),
             "config": vars(ctx.config),
-        }, buffer)
+        }
+
+        # Add scaler state if it exists (for AMP training)
+        if hasattr(ctx, 'scaler') and ctx.scaler is not None:
+            content['scaler_state_dict'] = ctx.scaler.state_dict()
+
+        torch.save(content, buffer)
         (ckpt / "last.pt").write_bytes(buffer.getvalue())
         (ckpt / f"step_{step + 1}.pt").write_bytes(buffer.getvalue())
         LOGGER.info(f"Saved checkpoint to {ckpt}/step_{step + 1}.pt")
     
     return
+
+
+def resume_from_checkpoint(ctx: BaseTrainContext):
+    if ctx.config.resume is None:
+        return ctx
+    
+    torch.distributed.barrier()
+    ckpt = torch.load(ctx.config.resume, map_location="cpu")
+
+    ctx.start = int(ckpt['step'])
+    ctx.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    ctx.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    
+    model = de_parallel(ctx.model)
+    csd = intersect_dicts(model.state_dict(), ckpt['model_state_dict'])
+    model.load_state_dict(csd)
+    print0(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
+    torch.distributed.barrier()
+    return ctx

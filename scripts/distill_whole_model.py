@@ -37,7 +37,11 @@ from attention_approximation.pytorch import (
 )
 from attention_approximation.utils import LOGGER, yaml_load
 import gc
-from attention_approximation.base import BaseTrainConfig, BaseTrainContext, setup_dataloaders, save_checkpoint, print0
+from attention_approximation.base import (
+    BaseTrainConfig, BaseTrainContext,
+    setup_dataloaders, save_checkpoint, print0,
+    resume_from_checkpoint
+)
 
 
 @dataclass
@@ -45,12 +49,10 @@ class TrainingConfig(BaseTrainConfig):
     """Stores all hyperparameters and configuration settings."""
     alpha: float = 0.5
     temperature: float = 2.0
-    from_checkpoint: str = "checkpoints/checkpoint_last.pt"
-    
+    from_checkpoint: str = "checkpoints/last.pt"
 
 class TrainContext(BaseTrainContext):
     teacher: nn.Module
-
 
 
 def setup_models(ctx: TrainContext):
@@ -65,7 +67,8 @@ def setup_models(ctx: TrainContext):
     csd = intersect_dicts(ckpt, teacher.state_dict())
     teacher.load_state_dict(csd, strict=False)
     print0(f"Transferred {len(csd)}/{len(teacher.state_dict())} items from pretrained weights")
-    teacher = torch.compile(teacher.to(ctx.device)).eval()
+    teacher = teacher.to(ctx.device).eval()
+    teacher.compile()
 
     # Student model
     ckpt = torch.load(ctx.config.from_checkpoint, map_location="cpu")
@@ -91,7 +94,7 @@ def setup_models(ctx: TrainContext):
     # Ensure we can load all weights into student model
     model.load_state_dict(csd, strict=True)
     LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from pretrained weights")
-    model = torch.compile(model.to(ctx.device))
+    model.to(ctx.device).compile()
 
     ctx.model, ctx.teacher = model, teacher
     if WORLD_SIZE > 1:
@@ -234,9 +237,9 @@ def validation_step(ctx: TrainContext, step: int):
     avg_kl = total_kl / (len(ctx.valid_loader) * WORLD_SIZE)
 
     ctx.tracker.log({
-        "val/loss": avg_loss,
-        "val/ce_loss": avg_ce,
-        "val/kl_loss": avg_kl,
+        "valid/loss": avg_loss,
+        "valid/ce_loss": avg_ce,
+        "valid/kl_loss": avg_kl,
     }, step=step)
     return ctx
 
@@ -248,9 +251,11 @@ def train(ctx: TrainContext):
     ctx.scheduler = CosineAnnealingLR(ctx.optimizer, T_max=ctx.config.max_steps, eta_min=ctx.config.min_lr)
     ctx = setup_dataloaders(ctx)
     ctx.train_iterator = iter(ctx.train_loader)
+    
+    ctx = resume_from_checkpoint(ctx)
     print0("Starting training...")
     ctx.optimizer.zero_grad()
-    for step in range(ctx.config.max_steps):
+    for step in range(ctx.start, ctx.config.max_steps):
         ctx = training_step(ctx, step)
         ctx = validation_step(ctx, step)
         save_checkpoint(ctx, step)
@@ -295,8 +300,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--tracker", type=str)
     parser.add_argument("--name", type=str)
-    parser.add_argument("--from_checkpoint", type=str, help="Path to a checkpoint file to resume training from.")
-    args = parser.parse_args()
+    parser.add_argument("--from_checkpoint", type=str, help="Path to initial student model checkpoint (from layer distillation).")
+
+    # Checkpoint resumption arguments
+    parser.add_argument("--resume", type=str)
 
     args = parser.parse_args()
     args = {k: v for k, v in vars(args).items() if v is not None}
