@@ -8,16 +8,6 @@ from attention_approximation.modeling_llama import LlamaForCausalLM as TeacherMo
 from attention_approximation.modeling_llama_approximated import LlamaForCausalLM as StudentModel
 
 
-def clean_state_dict_keys(state_dict):
-    """Remove torch.compile/DDP `_orig_mod.` prefix if present."""
-    prefix = "_orig_mod."
-    if not any(k.startswith(prefix) for k in state_dict):
-        return state_dict
-    return {
-        (k.replace(prefix, "", 1) if k.startswith(prefix) else k): v
-        for k, v in state_dict.items()
-    }
-
 
 def apply_repetition_penalty(logits: torch.Tensor, generated: torch.Tensor, penalty: float):
     """Down-weight logits for tokens that already appeared to discourage loops."""
@@ -73,8 +63,7 @@ if __name__ == "__main__":
     device = torch.device(args.device)
 
     model = StudentModel(config)
-    state_dict = clean_state_dict_keys(model_ckpt["model_state_dict"])
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(model_ckpt["model_state_dict"], strict=False)
     transferred = len(model.state_dict()) - len(missing)
     print(f"Transferred {transferred}/{len(model.state_dict())} items from pretrained weights")
     if missing:
