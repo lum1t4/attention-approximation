@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Dict, List, Optional, Type
 
-from attention_approximation.pytorch import rank_zero_only
+from attention_approximation.pytorch import rank_zero_only, RANK
 
 try:
     import wandb
@@ -45,15 +45,17 @@ class WandbTracker(Tracker):
         self.project: str = config["project"]
         self.run_name: str = config.get("name", None)
 
-        self.run = wandb.init(
-            project=self.project,
-            name=self.run_name,
-            config=config,
-            allow_val_change=True,
-        )
 
-        if "monitor" in config and "mode" in config:
-            self.run.define_metric(config["monitor"], summary=config["mode"])
+        if RANK in {-1, 0}:
+            self.run = wandb.init(
+                project=self.project,
+                name=self.run_name,
+                config=config,
+                allow_val_change=True,
+            )
+
+            if "monitor" in config and "mode" in config:
+                self.run.define_metric(config["monitor"], summary=config["mode"])
 
     @rank_zero_only
     def log(self, x, y: Optional[float] = None, step: Optional[int] = None) -> None:
